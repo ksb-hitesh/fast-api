@@ -37,6 +37,59 @@ https://another-site.net/watch?v=abcde
 
 ---
 
+### Step 0 — Get a tunnel up, and confirm the script is actually using it
+
+These sites are blocked by Indian ISPs in two ways, and both break the tool if ignored:
+
+- **DNS poisoning.** Your resolver answers blocked domains with a block-server address
+  (`13.127.247.216` / `202.56.230.30` here). The tool resolves over DNS-over-HTTPS instead,
+  so abuse lookups find the real host. Without that fix, every notice would have been
+  addressed to **your own ISP's abuse desk** about its own block page.
+- **SNI blocking.** TCP connects to the real server, then the TLS handshake is reset. No
+  amount of DNS trickery gets past this — fetching pages needs a real tunnel.
+
+Run WireGuard **inside WSL**. A VPN running in Windows very likely will *not* cover this
+shell: `.wslconfig` here has no `networkingMode=mirrored`, so WSL2 is on NAT networking.
+Your browser works, the script stays blocked, and blocked pages look like removed pages.
+
+```bash
+sudo apt install wireguard          # the kernel side is already present
+sudo cp cyber_secure.conf /etc/wireguard/wg0.conf
+sudo chmod 600 /etc/wireguard/wg0.conf
+sudo wg-quick up wg0
+
+python takedown.py urls.txt --preflight
+```
+
+Preflight tells you your exit IP and country, whether DNS is being lied to, and whether
+each host's TLS handshake actually completes:
+
+```
+exit IP 106.215.176.201 (IN)
+  -> going out through an Indian connection; expect ISP blocking
+
+  www.pornhub.com    DoH=66.254.114.41  system=13.127.247.216 POISONED  TLS reset - SNI blocked
+
+  NOT TUNNELLED - pages cannot be fetched from here, and a removal
+  check would be meaningless: everything would look gone when it isn't.
+```
+
+Run it before every fetch-based step. Blocking is intermittent, so a preflight that passed
+an hour ago can fail now.
+
+`sudo wg-quick down wg0` when you're done.
+
+**What needs the tunnel:**
+
+| Step | Tunnel required |
+|---|---|
+| `--preflight` | no (that's the point) |
+| `--evidence` | **yes** — refuses to run without it |
+| `discover.py` | **yes** — `--offline` runs the useful half without it |
+| reporting | **no** — RDAP and Abusix aren't blocked, and lookups use DoH |
+| `--check` | **yes** — refuses to mark anything removed without it |
+| `--followup` | no — reads local files only |
+
 ### Step 1 — Capture evidence. Do this BEFORE anything else.
 
 ```bash
@@ -44,17 +97,91 @@ python takedown.py urls.txt --evidence
 ```
 
 A successful takedown destroys the proof the material was ever there. This grabs
-it first: the page markup, a SHA-256 hash, and a **Wayback Machine copy** with an
-independent timestamp. Police, a lawyer, or a civil claim will all ask for this.
+it first: the page markup, a SHA-256 hash, and an **RFC-3161 trusted timestamp**
+from freetsa.org. Police, a lawyer, or a civil claim will all ask for this.
 
-Produces `out/evidence/` (with `MANIFEST.csv`) and `out/DISCOVERY.md`.
+The timestamp is a third party's signature saying *this exact file existed at this
+exact time*. It proves the page was there without publishing anything — verified
+offline, years later, with:
+
+```bash
+cd out/evidence
+openssl ts -verify -in PAGE.tsr -queryfile PAGE.tsq -CAfile cacert.pem -untrusted tsa.crt
+# Verification: OK
+```
+
+Change one byte of the saved page and that returns `Verification: FAILED`.
+
+Produces `out/evidence/` (with `MANIFEST.csv` and `VERIFY.md`) and `out/DISCOVERY.md`.
 
 The video itself is deliberately not downloaded. You don't need more copies of it.
 
-**Then:** work through `out/DISCOVERY.md`. It has reverse-image and exact-title
-search links built from each page. Anything new you find goes into `urls.txt`, and
-you re-run this step. A first pass typically finds well under half of what exists,
-so this is where the outcome is really decided.
+`--archive` additionally pushes each URL to the Wayback Machine. It is **off by
+default and you should think before using it**: it creates a permanent *public* copy
+of the material, which is one more place you'd then have to get it removed from. The
+timestamp above proves the same fact privately.
+
+### Step 1b — Find the rest of the copies
+
+A first pass typically finds well under half of what exists, so this is where the
+outcome is really decided.
+
+```bash
+python discover.py
+```
+
+It reads the pages `--evidence` already saved and works outward from them. The key
+thing it finds is that **the pages are not where the video lives**:
+
+```
+## https://luluvdo.com/e/wllrgcrkn9zo
+Embedded by 6 known page(s):
+  https://maal69.int.in/beautiful-milf-blowjob-pussy-fingering-by-husband-hd-video/
+  https://fry99.center/beautiful-milf-blowjob-pussy-fingering-by-husband-watch/
+  ...
+```
+
+Those sites are WordPress shells. The file sits on a video host they all embed, so
+16 page URLs turn out to be **4 files**. Removing one file kills every page carrying
+it at once, and the file host is a single abuse desk instead of one per site — which
+is why `out/candidates.txt` puts those embed URLs first. Add them to `urls.txt` and
+the reporter goes after the file host like any other target.
+
+It also finds:
+
+- **New copies.** Every farm site is WordPress, so it searches each one's own `/?s=`,
+  mines `/actor/` and `/tag/` listings, and tries known slugs on sibling domains.
+- **Mirror domains** — `maal69.cool` serving `maal69.int.in`, `luluvdo.com` landing on
+  `lulustream.com`. A second domain is a second registrar to go after, and it keeps
+  working after the first is suspended.
+- **What it could not reach.** Hosts that never answered are listed as *not searched*.
+  That is not the same as nothing being there, and the report says so rather than
+  letting silence read as an all-clear.
+
+Each hit is fetched and classified before it is reported:
+
+| Tier | Meaning |
+|---|---|
+| `CONFIRMED` | embeds one of the exact files in `EMBEDS.md`. No judgement call. |
+| `LIKELY` | a different file on a host the farm already uses, title matches |
+| `MAYBE` | title matches, no embed readable |
+
+**Only `CONFIRMED` reaches `candidates.txt`.** Nothing is ever appended to `urls.txt`
+automatically — a notice about the wrong content costs you credibility with the one
+desk that did act. Read them, then:
+
+```bash
+cat out/candidates.txt >> urls.txt
+python takedown.py urls.txt --evidence      # capture the new ones too
+```
+
+`--offline` runs the file-extraction half with no network at all, so `EMBEDS.md` is
+still produced from inside the ISP block.
+
+**Then keep going by hand** with `out/DISCOVERY.md` — reverse-image and exact-title
+links built from each page. Yandex Images finds copies no text search will, and
+nothing here replaces it. Re-run `discover.py` each time you add URLs: new sites
+mean new sites to search.
 
 ### Step 2 — File on the cybercrime portal
 
@@ -91,6 +218,10 @@ python takedown.py --check
 Re-fetches every URL and records what it found. Safe to run as often as you like —
 after two hours, the next morning, a week later.
 
+**It runs preflight first and aborts if the tunnel is down**, recording those URLs as
+ rather than guessing. From inside the ISP block every site looks gone, and a
+false  is the one error that would make you stop chasing something still online.
+
 ### Step 5 — Chase whoever missed the deadline
 
 ```bash
@@ -119,15 +250,16 @@ pick the work back up weeks later.
 | https://site.com/b | OVERDUE | yes | 2026-09-11 12:26 | 2026-09-11 14:26 | 2026-09-11 18:26 | still up (200) |
 
 `STATUS.csv` is the same data with every column — opens in Excel, and holds the
-page hash, the Wayback link, and exactly which abuse desks were contacted per URL.
+page hash, the timestamp proof, and exactly which abuse desks were contacted per URL.
 
 | State | Meaning | What to do |
 |---|---|---|
 | `NEW` | in the list, nothing done | step 1 |
-| `EVIDENCE` | snapshot + Wayback copy taken | step 3 |
+| `EVIDENCE` | page saved, hashed and timestamped | step 3 |
 | `REPORTED` | notices sent, still inside the deadline | wait, then `--check` |
 | `OVERDUE` | deadline passed, still up | `--followup` |
 | `CHASED` | second notice sent | `ESCALATE.md` |
+| `BLOCKED` | your connection can't reach it | bring the tunnel up, re-check |
 | `UNCLEAR` | the check couldn't tell | open it yourself and look |
 | `REMOVED` | confirmed gone | nothing |
 
@@ -145,8 +277,13 @@ their history.
 | `--india` | Rule 3(2)(b), IT Rules 2021 as amended by G.S.R. 120(E) (in force 20 Feb 2026): removal **within 2 hours of your complaint**, and loss of Section 79 safe harbour if missed. Triggers on your complaint alone — no court order. Use this. |
 | `--self-recorded` | **Only if you filmed it yourself.** Adds a DMCA §512(c) claim sworn under penalty of perjury, so it also needs `--postal`. If someone else recorded it you don't hold the copyright — leave this off and the notice runs on NCII grounds instead. |
 | `--eu` | adds a GDPR Art. 17 erasure demand |
+| `--preflight` | can this shell reach the sites, and is DNS being lied to? |
+| `--archive` | also push to the Wayback Machine. **Off by default** — creates a public copy |
 | `--send-from` | send from a different address than the reply-to |
 | `--out` | output directory (default `out/`) |
+
+`discover.py` takes `--offline` (no network), `--rounds N` (how many times a newly
+found site feeds the next search, default 2) and `--out`.
 
 ### Before you start
 
@@ -170,14 +307,20 @@ out/
   NN-*.eml            one draft per abuse desk
   FORMS.md            desks that only take a web form
   SEARCH-ENGINES.md   de-indexing links + paste-ready URL list
-  DISCOVERY.md        leads for copies you haven't found
+  DISCOVERY.md        manual reverse-image / title search leads
+  EMBEDS.md           the actual video files, and which pages embed each one
+  CANDIDATES.md       ranked new copies, mirror domains, hosts not reached
+  candidates.txt      CONFIRMED URLs + file hosts, ready for urls.txt
   LOG.csv             full contact log (who, what, when)
   evidence/
-    MANIFEST.csv      timestamps, hashes, Wayback links
+    MANIFEST.csv      timestamps, hashes, capture times
     *.html            pages exactly as served
+    *.tsq *.tsr       RFC-3161 timestamp proofs
+    tsa.crt cacert.pem  certs to verify them offline, later
+    VERIFY.md         how to verify
   followup/
     NN-*.eml          second notices
     ESCALATE.md       ordered escalation path
 ```
 
-Checks: `python test_takedown.py` (offline, no network).
+Checks: `python test_takedown.py` and `python test_discover.py` (offline, no network).

@@ -15,6 +15,7 @@ import hashlib
 import json
 import re
 import socket
+import ssl
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -43,6 +44,7 @@ CDN_FORMS = {
     "stackpath": ("StackPath", "https://www.stackpath.com/legal/abuse/"),
 }
 
+SITE_SCRAPE_BUDGET = 25.0  # seconds, total, for the whole optional site scrape
 SITE_PATHS = ["/dmca", "/abuse", "/legal", "/contact", "/takedown",
               "/content-removal", "/2257", "/terms", "/"]
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]*\w")
@@ -85,12 +87,15 @@ destroys the proof that the material was ever there. Police, a lawyer or a civil
 claim will all ask for this.
 
   MANIFEST.csv    one row per URL: when it was captured, the page title, the
-                  SHA-256 of the page, and the Wayback Machine copy
+                  SHA-256 of the page, and its trusted timestamp
   evidence.json   the same plus full HTTP response headers
   *.html          the page markup exactly as served
+  *.tsq / *.tsr   RFC-3161 timestamp request and signed response
+  VERIFY.md       how to verify those, years from now
 
-The `wayback` column is the important one. A file on your own disk is easy to
-dismiss; a dated copy held by an independent public archive is not.
+The timestamps are what make this hold up. A file on your own disk is easy to
+dismiss; a third party's signature saying that exact file existed at that exact
+time is not - and unlike a public archive, it publishes nothing.
 
 The video itself is deliberately NOT downloaded here. You do not need more copies
 of it, and no abuse desk will ask you for one.
@@ -316,23 +321,206 @@ async def site_contacts(client: httpx.AsyncClient, hostname: str) -> list[Contac
     return [Contact("site", f"{hostname} (site operator)", a, "email") for a in found]
 
 
-async def lookup_host(client: httpx.AsyncClient, hostname: str) -> tuple[str, list[Contact]]:
+async def bounded(coro, seconds: float) -> list:
+    """Run an optional lookup under a hard time budget; give up quietly."""
     try:
-        ip = await asyncio.to_thread(socket.gethostbyname, hostname)
-    except OSError:
+        return await asyncio.wait_for(coro, timeout=seconds)
+    except (asyncio.TimeoutError, httpx.HTTPError):
+        return []
+
+
+async def lookup_host(client: httpx.AsyncClient, hostname: str) -> tuple[str, list[Contact]]:
+    # DoH, never the system resolver: a poisoned answer would point every abuse
+    # lookup at the ISP's block server and address the notices to its host.
+    ip, _ = await resolve(client, hostname)
+    if not ip:
         return "", []
     host, reg, site = await asyncio.gather(
         hosting_contacts(client, ip),
         registrar_contacts(client, hostname),
-        site_contacts(client, hostname),
+        # Scraping the site's own /dmca page is nine requests, and against a blocked
+        # host each one hangs to timeout - minutes per site. It is a bonus contact,
+        # never a dependency, so it gets a hard cap. RDAP and Abusix are not blocked
+        # and always run.
+        bounded(site_contacts(client, hostname), SITE_SCRAPE_BUDGET),
     )
     return ip, host + reg + site
+
+
+# ---------------------------------------------------------------- resolution
+
+DOH_ENDPOINTS = [("Cloudflare", "https://cloudflare-dns.com/dns-query"),
+                 ("Google", "https://dns.google/resolve")]
+
+# Indian ISPs answer blocked domains with one shared block-server address, so the
+# system resolver cannot be trusted to say who hosts anything. Every lookup that
+# feeds an abuse contact goes through DoH; the system answer is kept only so the
+# two can be compared and the poisoning reported.
+_dns_cache: dict[str, tuple[str, str]] = {}
+
+
+async def doh_resolve(client: httpx.AsyncClient, hostname: str) -> str:
+    """First A record for hostname, resolved over DNS-over-HTTPS."""
+    for _, endpoint in DOH_ENDPOINTS:
+        try:
+            r = await client.get(endpoint, params={"name": hostname, "type": "A"},
+                                 headers={"accept": "application/dns-json"}, timeout=15)
+            if r.status_code != 200:
+                continue
+            data = r.json()
+        except (httpx.HTTPError, ValueError):
+            continue
+        if data.get("Status") not in (0, None):
+            continue
+        for ans in data.get("Answer") or []:
+            if ans.get("type") == 1 and ans.get("data"):
+                return ans["data"]
+    return ""
+
+
+def system_resolve(hostname: str) -> str:
+    try:
+        return socket.gethostbyname(hostname)
+    except OSError:
+        return ""
+
+
+async def resolve(client: httpx.AsyncClient, hostname: str) -> tuple[str, str]:
+    """(real_ip, system_ip). Only the first is ever acted on."""
+    if hostname not in _dns_cache:
+        real, sys_ip = await asyncio.gather(
+            doh_resolve(client, hostname),
+            asyncio.to_thread(system_resolve, hostname))
+        _dns_cache[hostname] = (real, sys_ip)
+    return _dns_cache[hostname]
+
+
+def poisoned_hosts(resolved: dict[str, tuple[str, str]]) -> dict[str, str]:
+    """{hostname: block_server_ip} for hosts the local resolver lied about.
+
+    Two signals, either is enough: the system answer disagrees with DoH, or several
+    unrelated hostnames share one system answer (the block server's signature).
+    """
+    # Only the shared-address signal is used. "System answer differs from DoH" on its
+    # own is far too noisy: any CDN or geo-balanced site legitimately hands different
+    # resolvers different IPs, and flagging those would cry wolf on half the internet.
+    shared: dict[str, list[str]] = {}
+    for host, (_, sys_ip) in resolved.items():
+        if sys_ip:
+            shared.setdefault(sys_ip, []).append(host)
+    return {host: sys_ip
+            for host, (_, sys_ip) in resolved.items()
+            if sys_ip and len(shared.get(sys_ip, [])) > 1}
+
+
+def tls_reachable(ip: str, hostname: str, timeout: float = 8.0) -> str:
+    """"" if the TLS handshake completes, else why it failed.
+
+    A reset during the handshake - after TCP connected - is SNI-based blocking:
+    the packet inspector saw the hostname in the ClientHello and killed it.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        sock = socket.create_connection((ip, 443), timeout=timeout)
+    except OSError as e:
+        return f"TCP failed ({type(e).__name__})"
+    try:
+        with ctx.wrap_socket(sock, server_hostname=hostname):
+            return ""
+    except ConnectionResetError:
+        return "TLS reset - SNI blocked"
+    except OSError as e:
+        return f"TLS failed ({type(e).__name__})"
+    finally:
+        sock.close()
+
+
+async def exit_ip(client: httpx.AsyncClient) -> tuple[str, str]:
+    """(ip, country) of whatever this process actually goes out through."""
+    try:
+        r = await client.get("https://www.cloudflare.com/cdn-cgi/trace", timeout=15)
+        fields = dict(ln.split("=", 1) for ln in r.text.splitlines() if "=" in ln)
+        return fields.get("ip", ""), fields.get("loc", "")
+    except (httpx.HTTPError, ValueError):
+        return "", ""
+
+
+async def preflight(client: httpx.AsyncClient, hosts: list[str]) -> dict:
+    """Can this process actually reach these sites, and is DNS being lied to?"""
+    ip, loc = await exit_ip(client)
+    resolved = {}
+    for h in hosts:
+        resolved[h] = await resolve(client, h)
+    poisoned = poisoned_hosts(resolved)
+
+    blocked = {}
+    for h, (real, _) in resolved.items():
+        if not real:
+            blocked[h] = "could not resolve"
+            continue
+        why = await asyncio.to_thread(tls_reachable, real, h)
+        if why:
+            blocked[h] = why
+    # Poisoning is a warning, not a blocker: every lookup already uses the DoH answer,
+    # so the abuse contacts are right either way. Only reachability decides whether
+    # pages can be fetched and a removal check can be believed.
+    return {"exit_ip": ip, "country": loc, "resolved": resolved,
+            "poisoned": poisoned, "blocked": blocked, "tunnel_ok": not blocked}
+
+
+def print_preflight(pf: dict) -> None:
+    print(f"\nexit IP {pf['exit_ip'] or '?'} ({pf['country'] or '?'})")
+    if pf["country"] == "IN":
+        print("  -> going out through an Indian connection; expect ISP blocking")
+    print()
+    for host, (real, sys_ip) in sorted(pf["resolved"].items()):
+        bits = [f"DoH={real or 'FAILED'}"]
+        if host in pf["poisoned"]:
+            bits.append(f"system={sys_ip} POISONED")
+        elif sys_ip and sys_ip != real:
+            bits.append(f"system={sys_ip}")
+        blocked = pf["blocked"].get(host)
+        bits.append(blocked or "reachable")
+        print(f"  {host:38} {'  '.join(bits)}")
+
+    if pf["poisoned"]:
+        servers = sorted(set(pf["poisoned"].values()))
+        print(f"\n  Your resolver is answering with {', '.join(servers)} for "
+              f"{len(pf['poisoned'])} host(s).")
+        print("  That is a block server, not the real host. Lookups use DoH instead,")
+        print("  so the abuse contacts stay correct - this is a warning, not a failure.")
+
+    if pf["tunnel_ok"]:
+        print("\n  TUNNEL OK - pages can be fetched and checks can be trusted.")
+    else:
+        print("\n  NOT TUNNELLED - pages cannot be fetched from here, and a removal")
+        print("  check would be meaningless: everything would look gone when it isn't.")
+        print("\n  Bring the tunnel up inside WSL (a VPN running in Windows very likely")
+        print("  does NOT cover this shell - WSL2 is on NAT networking here):")
+        print("      sudo apt install wireguard")
+        print("      sudo cp your.conf /etc/wireguard/wg0.conf")
+        print("      sudo chmod 600 /etc/wireguard/wg0.conf")
+        print("      sudo wg-quick up wg0")
+        print("  then re-run this preflight.")
+
+
+async def run_preflight(args) -> int:
+    hosts = list(dict.fromkeys(urlsplit(u).hostname for u in read_urls(args.urls)
+                               if urlsplit(u).hostname))
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True,
+                                 headers={"User-Agent": UA}) as client:
+        pf = await preflight(client, hosts)
+    print_preflight(pf)
+    return 0 if pf["tunnel_ok"] else 1
 
 
 # ---------------------------------------------------------------- status table
 
 STATUS_FIELDS = ["url", "hostname", "first_seen_utc", "evidence_utc", "page_sha256",
-                 "wayback", "reported_utc", "deadline_utc", "contacts", "followup_utc",
+                 "timestamp", "wayback", "reported_utc", "deadline_utc", "contacts",
+                 "followup_utc",
                  "last_checked_utc", "http_status", "check_note", "removed_utc"]
 
 # Phrases sites put up in place of a removed video. Deliberately conservative:
@@ -377,6 +565,8 @@ def state_of(row: dict, now: datetime) -> str:
     """Derived, never stored - so it can't go stale against the facts."""
     if row.get("removed_utc"):
         return "REMOVED"
+    if row.get("check_note") == "blocked":
+        return "BLOCKED"
     if row.get("check_note") == "unclear":
         return "UNCLEAR"
     if row.get("followup_utc"):
@@ -393,8 +583,8 @@ def state_of(row: dict, now: datetime) -> str:
 
 def write_status_table(out: Path, rows: dict[str, dict]) -> None:
     now = datetime.now(timezone.utc)
-    order = {"REMOVED": 0, "OVERDUE": 1, "CHASED": 2, "UNCLEAR": 3,
-             "REPORTED": 4, "EVIDENCE": 5, "NEW": 6}
+    order = {"REMOVED": 0, "OVERDUE": 1, "CHASED": 2, "BLOCKED": 3, "UNCLEAR": 4,
+             "REPORTED": 5, "EVIDENCE": 6, "NEW": 7}
     items = sorted(rows.values(), key=lambda r: (order.get(state_of(r, now), 9), r["url"]))
 
     counts: dict[str, int] = {}
@@ -447,6 +637,10 @@ async def check_one(client: httpx.AsyncClient, url: str, expect_sha: str) -> tup
     """
     try:
         r = await client.get(url)
+    except (httpx.ConnectError, httpx.ReadError) as e:
+        if isinstance(e.__cause__, ConnectionResetError) or "reset" in str(e).lower():
+            return "", "blocked"
+        return "", f"unclear ({type(e).__name__})"
     except httpx.HTTPError as e:
         return "", f"unclear ({type(e).__name__})"
 
@@ -478,6 +672,27 @@ async def run_check(args) -> int:
     sem = asyncio.Semaphore(4)
     async with httpx.AsyncClient(timeout=20, follow_redirects=True,
                                  headers={"User-Agent": UA}) as client:
+        # A check from inside the block is worthless: every site looks gone. Establish
+        # first whether this process can reach anything at all, and if it cannot,
+        # record that fact instead of a removal.
+        hosts = list(dict.fromkeys(r["hostname"] for r in rows.values() if r["hostname"]))
+        pf = await preflight(client, hosts)
+        if not pf["tunnel_ok"]:
+            print_preflight(pf)
+            blocked_hosts = set(pf["blocked"])
+            update_status(out, {
+                u: {"last_checked_utc": now_utc(), "check_note": "blocked", "http_status": ""}
+                for u, r in rows.items() if r["hostname"] in blocked_hosts})
+            write_status_table(out, load_status(out))
+            skipped = sum(1 for r in rows.values() if r["hostname"] not in blocked_hosts)
+            print(f"\nRecorded {len(blocked_hosts)} host(s) as BLOCKED. The check was "
+                  f"aborted, so the other {skipped} URL(s) were not checked at all - "
+                  f"their last result is stale, not current.")
+            print("Nothing was marked removed: from here that cannot be established.")
+            print("Blocking is intermittent, so a preflight that passed earlier may fail "
+                  "now. Bring the tunnel up and run --check again.")
+            return 1
+
         async def one(url, row):
             async with sem:
                 code, verdict = await check_one(client, url, row.get("page_sha256", ""))
@@ -508,6 +723,75 @@ async def run_check(args) -> int:
 
 
 # ---------------------------------------------------------------- evidence
+
+TSA_URL = "https://freetsa.org/tsr"
+TSA_CERTS = {"tsa.crt": "https://freetsa.org/files/tsa.crt",
+             "cacert.pem": "https://freetsa.org/files/cacert.pem"}
+
+
+async def timestamp_file(client: httpx.AsyncClient, path: Path) -> str:
+    """RFC-3161 trusted timestamp over the saved page. Returns the TSA name or "".
+
+    Proves this exact file existed at this exact time, to a third party's signature,
+    WITHOUT publishing anything. That matters here: pushing the page to a public
+    archive would create another reachable copy of the material.
+    """
+    tsq, tsr = path.with_suffix(".tsq"), path.with_suffix(".tsr")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "openssl", "ts", "-query", "-data", str(path), "-sha512", "-cert",
+            "-no_nonce", "-out", str(tsq),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            return ""
+        r = await client.post(TSA_URL, content=tsq.read_bytes(),
+                              headers={"Content-Type": "application/timestamp-query"},
+                              timeout=60)
+        if r.status_code != 200 or not r.content:
+            return ""
+        tsr.write_bytes(r.content)
+        return "freetsa.org"
+    except (OSError, httpx.HTTPError):
+        return ""
+
+
+async def fetch_tsa_certs(client: httpx.AsyncClient, ev: Path) -> None:
+    """Keep the verification certs alongside the proof, so it stays checkable
+    years from now without depending on freetsa.org still being up."""
+    for name, url in TSA_CERTS.items():
+        dest = ev / name
+        if dest.exists():
+            continue
+        try:
+            r = await client.get(url, timeout=30)
+            if r.status_code == 200:
+                dest.write_bytes(r.content)
+        except httpx.HTTPError:
+            pass
+
+
+VERIFY_MD = """\
+# Verifying the timestamps
+
+Each captured page has a matching `.tsq` (the request) and `.tsr` (the signed
+response from freetsa.org). Together they prove that exact file existed at that
+exact time. Nothing about the page was published to produce this proof.
+
+To verify any one of them:
+
+    openssl ts -verify -in PAGE.tsr -queryfile PAGE.tsq \\
+        -CAfile cacert.pem -untrusted tsa.crt
+
+`Verification: OK` means the file is unmodified since the timestamp.
+
+To read the timestamp itself:
+
+    openssl ts -reply -in PAGE.tsr -text
+
+Keep this whole folder together, unmodified, and keep a second copy elsewhere.
+"""
+
 
 async def capture_one(client: httpx.AsyncClient, url: str, ev: Path) -> dict:
     """Snapshot a page so proof survives the takedown that destroys it.
@@ -555,16 +839,24 @@ async def archive_one(client: httpx.AsyncClient, url: str) -> str:
     return f"https://web.archive.org{loc}" if loc else str(r.url)
 
 
-async def capture_evidence(client, urls: list[str], out: Path) -> list[dict]:
+async def capture_evidence(client, urls: list[str], out: Path,
+                           archive: bool = False) -> list[dict]:
     ev = out / "evidence"
     ev.mkdir(parents=True, exist_ok=True)
     sem = asyncio.Semaphore(4)
+
+    await fetch_tsa_certs(client, ev)
 
     async def one(u):
         async with sem:
             print(f"  capturing {u} ...", file=sys.stderr)
             rec = await capture_one(client, u, ev)
-            rec["wayback"] = await archive_one(client, u)
+            if rec.get("saved_as"):
+                rec["timestamp"] = await timestamp_file(client, ev / rec["saved_as"])
+            # Public archiving is opt-in: it would put another reachable copy of the
+            # material online, which is the opposite of what we are trying to achieve.
+            if archive:
+                rec["wayback"] = await archive_one(client, u)
             return rec
 
     records = list(await asyncio.gather(*(one(u) for u in urls)))
@@ -573,13 +865,15 @@ async def capture_evidence(client, urls: list[str], out: Path) -> list[dict]:
     with (ev / "MANIFEST.csv").open("w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["captured_at_utc", "url", "http_status", "page_title",
-                    "sha256_of_page", "saved_as", "wayback", "error"])
+                    "sha256_of_page", "saved_as", "timestamp", "wayback", "error"])
         for r in records:
             w.writerow([r.get("captured_at_utc", ""), r["url"], r.get("http_status", ""),
                         r.get("page_title", ""), r.get("sha256_of_page", ""),
-                        r.get("saved_as", ""), r.get("wayback", ""), r.get("error", "")])
+                        r.get("saved_as", ""), r.get("timestamp", ""),
+                        r.get("wayback", ""), r.get("error", "")])
 
     (ev / "README.md").write_text(EVIDENCE_README)
+    (ev / "VERIFY.md").write_text(VERIFY_MD)
     return records
 
 
@@ -805,24 +1099,35 @@ async def run_evidence(args) -> int:
     out = Path(args.out)
     async with httpx.AsyncClient(timeout=30, follow_redirects=True,
                                  headers={"User-Agent": UA}) as client:
-        records = await capture_evidence(client, urls, out)
+        hosts = list(dict.fromkeys(urlsplit(u).hostname for u in urls if urlsplit(u).hostname))
+        pf = await preflight(client, hosts)
+        if not pf["tunnel_ok"]:
+            print_preflight(pf)
+            print("\nNot capturing anything: the pages cannot be reached from here, so "
+                  "the evidence would be empty or a block page.")
+            return 1
+        records = await capture_evidence(client, urls, out, archive=args.archive)
     write_discovery(records, out)
     rows = update_status(out, {
         r["url"]: {"evidence_utc": r.get("captured_at_utc", ""),
                    "page_sha256": r.get("sha256_of_page", ""),
+                   "timestamp": r.get("timestamp", ""),
                    "wayback": r.get("wayback", "")}
         for r in records if not r.get("error")})
     write_status_table(out, rows)
     ok = [r for r in records if not r.get("error")]
-    archived = [r for r in ok if r.get("wayback")]
+    stamped = [r for r in ok if r.get("timestamp")]
     print(f"\ncaptured {len(ok)}/{len(urls)} page(s) -> {out}/evidence/")
-    print(f"archived {len(archived)}/{len(urls)} to the Wayback Machine")
+    print(f"timestamped {len(stamped)}/{len(urls)} with freetsa.org (private proof)")
+    if args.archive:
+        print(f"archived {sum(1 for r in ok if r.get('wayback'))}/{len(urls)} publicly "
+              f"to the Wayback Machine")
     for r in records:
         if r.get("error"):
             print(f"  !! could not capture {r['url']}: {r['error']}")
-        elif not r.get("wayback"):
-            print(f"  !  no Wayback copy for {r['url']} - save it manually at "
-                  f"https://web.archive.org/save/")
+        elif not r.get("timestamp"):
+            print(f"  !  no timestamp for {r['url']} - the page is still saved and "
+                  f"hashed, but unsigned")
     print(f"\nLeads for finding more copies: {out}/DISCOVERY.md")
     print(f"Progress table: {out}/STATUS.md")
     print("Keep a second copy of the evidence folder somewhere else.")
@@ -901,6 +1206,13 @@ def main() -> int:
                    help="capture proof first: page markup, hashes and a Wayback copy per "
                         "URL, plus DISCOVERY.md. DO THIS BEFORE REPORTING - a successful "
                         "takedown destroys the evidence.")
+    p.add_argument("--preflight", action="store_true",
+                   help="can this shell actually reach the sites, and is DNS being "
+                        "lied to? Run before every fetch-based step.")
+    p.add_argument("--archive", action="store_true",
+                   help="also push each URL to the Wayback Machine. OFF by default: it "
+                        "creates a PUBLIC permanent copy of the material. The private "
+                        "freetsa.org timestamp proves the same thing without publishing.")
     p.add_argument("--check", action="store_true",
                    help="re-fetch every URL in STATUS.csv and record whether it is "
                         "actually gone. Safe to re-run as often as you like.")
@@ -914,6 +1226,10 @@ def main() -> int:
         if not args.urls:
             sys.exit("--evidence needs the URL file")
         return asyncio.run(run_evidence(args))
+    if args.preflight:
+        if not args.urls:
+            sys.exit("--preflight needs the URL file")
+        return asyncio.run(run_preflight(args))
     if args.check:
         return asyncio.run(run_check(args))
     if args.followup:

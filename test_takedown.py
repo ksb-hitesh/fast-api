@@ -10,9 +10,9 @@ import hashlib
 
 import httpx
 
-from takedown import (STATUS_FIELDS, Contact, check_one, group_contacts, jinja_env,
-                      load_status, overdue_rows, render, slug, state_of,
-                      update_status, write_discovery)
+from takedown import (STATUS_FIELDS, Contact, check_one, doh_resolve, group_contacts,
+                      jinja_env, load_status, overdue_rows, poisoned_hosts, render,
+                      slug, state_of, update_status, write_discovery)
 
 
 def test_grouping():
@@ -253,6 +253,96 @@ def test_check_verdicts():
     print("check verdicts OK")
 
 
+def test_doh_parsing():
+    """Resolution must come from DoH, and fall through to the backup on a bad answer."""
+    import asyncio
+
+    class Resp:
+        def __init__(self, payload, status=200):
+            self.status_code, self._p = status, payload
+        def json(self):
+            if isinstance(self._p, Exception):
+                raise self._p
+            return self._p
+
+    class Client:
+        def __init__(self, *responses):
+            self.responses, self.calls = list(responses), []
+        async def get(self, url, **kw):
+            self.calls.append(url)
+            r = self.responses.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+
+    ok = Resp({"Status": 0, "Answer": [{"type": 5, "data": "cname."},
+                                       {"type": 1, "data": "1.2.3.4"}]})
+    assert asyncio.run(doh_resolve(Client(ok), "x.com")) == "1.2.3.4"
+
+    # NXDOMAIN from Cloudflare must fall through to Google, not be taken as truth
+    c = Client(Resp({"Status": 3}), Resp({"Status": 0, "Answer": [{"type": 1, "data": "5.6.7.8"}]}))
+    assert asyncio.run(doh_resolve(c, "x.com")) == "5.6.7.8"
+    assert len(c.calls) == 2 and "dns.google" in c.calls[1]
+
+    # both failing must return "" rather than something made up
+    c = Client(httpx.ConnectError("no"), Resp({"Status": 2}))
+    assert asyncio.run(doh_resolve(c, "x.com")) == ""
+    print("DoH parsing OK")
+
+
+def test_poison_detection():
+    """The block-server signature is several unrelated hosts sharing one address.
+    A CDN handing different resolvers different IPs must NOT be flagged."""
+    poisoned = poisoned_hosts({
+        "pornhub.com": ("66.254.114.41", "13.127.247.216"),
+        "xvideos.com": ("89.222.127.13", "13.127.247.216"),
+        "github.com": ("20.207.73.82", "20.207.73.82"),
+    })
+    assert set(poisoned) == {"pornhub.com", "xvideos.com"}, f"got {set(poisoned)}"
+    assert poisoned["pornhub.com"] == "13.127.247.216"
+
+    # a single site whose DoH and system answers differ is ordinary geo-DNS, not a block
+    assert poisoned_hosts({"example.com": ("93.184.1.1", "23.55.2.2")}) == {}, \
+        "must not cry wolf on multi-IP sites"
+    # hosts that failed to resolve at all are not evidence of anything
+    assert poisoned_hosts({"a.com": ("", ""), "b.com": ("", "")}) == {}
+    print("poison detection OK")
+
+
+def test_blocked_is_not_removed():
+    """The one that matters: a page we cannot reach must never be recorded as
+    removed. A false all-clear makes the user stop chasing something still online."""
+    import asyncio
+
+    class Resp:
+        def __init__(self, status, body=b""):
+            self.status_code, self.content, self.encoding = status, body, "utf-8"
+
+    class Client:
+        def __init__(self, exc): self.exc = exc
+        async def get(self, url, **kw): raise self.exc
+
+    reset = httpx.ConnectError("connection reset by peer")
+    assert asyncio.run(check_one(Client(reset), "https://x/y", ""))[1] == "blocked"
+
+    # 'blocked' is its own state - not REMOVED, not merely UNCLEAR
+    now = datetime(2026, 9, 11, 14, 0, tzinfo=timezone.utc)
+    base = dict.fromkeys(STATUS_FIELDS, "")
+    assert state_of({**base, "check_note": "blocked"}, now) == "BLOCKED"
+    assert state_of({**base, "check_note": "unclear"}, now) == "UNCLEAR"
+    # and it must never be confused with a confirmed removal
+    assert state_of({**base, "check_note": "blocked"}, now) != "REMOVED"
+
+    # a blocked verdict must not carry a removal timestamp through the update path
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d)
+        rows = update_status(out, {"https://x/y": {"check_note": "blocked",
+                                                   "last_checked_utc": now.isoformat()}})
+        assert rows["https://x/y"]["removed_utc"] == "", \
+            "a blocked check must leave removed_utc empty"
+    print("blocked != removed OK")
+
+
 def test_slug():
     assert slug("abuse@ovh.net") == "abuse-ovh.net"
     assert "/" not in slug("https://abuse.cloudflare.com/")
@@ -269,5 +359,8 @@ if __name__ == "__main__":
     test_status_accumulates()
     test_state_transitions()
     test_check_verdicts()
+    test_doh_parsing()
+    test_poison_detection()
+    test_blocked_is_not_removed()
     test_slug()
     print("\nall checks passed")
