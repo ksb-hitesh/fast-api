@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: takedown
+    runtime: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: APP_PASSWORD      # set this yourself - the app refuses to boot without it
+        sync: false
+      - key: MONGODB_URI       # Atlas M0 connection string; without it state is ephemeral
+        sync: false
+      - key: MONGODB_DB
+        value: takedown
+      - key: SESSION_SECRET
+        generateValue: true

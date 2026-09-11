@@ -222,3 +222,6 @@ urls.txt
 out/
 *.eml
 LOG.csv
+
+# web app local state - holds your legal name, email and postal address
+config.json

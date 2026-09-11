@@ -1,0 +1,15 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>takedown</title>
+<link rel="stylesheet" href="/static/app.css">
+<main class="login">
+  <h1>takedown</h1>
+  <p class="muted">NCII takedown reporter</p>
+  <form method="post" action="/login">
+    <input type="password" name="password" placeholder="Password" autofocus
+           autocomplete="current-password" required>
+    {% if bad %}<p class="err">Wrong password.</p>{% endif %}
+    <button type="submit">Sign in</button>
+  </form>
+</main>

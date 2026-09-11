@@ -1048,10 +1048,17 @@ def write_outputs(args, results, groups, ips: dict, out: Path) -> None:
     (out / "SEARCH-ENGINES.md").write_text(
         SEARCH_ENGINES.format(urls="\n".join(all_urls)))
 
-    with (out / "LOG.csv").open("w", newline="") as fh:
+    # Append, never truncate. --followup reads this file to find who missed a
+    # deadline; a second reporting pass that wiped it would leave the escalation
+    # chasing nobody. overdue_rows() takes min(first_sent)/max(age) per desk, so
+    # older rows surviving makes it cite the true first contact date.
+    log = out / "LOG.csv"
+    fresh = not log.exists()
+    with log.open("a", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["logged_at_utc", "url", "hostname", "ip", "kind", "provider",
-                    "contact", "contact_type"])
+        if fresh:
+            w.writerow(["logged_at_utc", "url", "hostname", "ip", "kind", "provider",
+                        "contact", "contact_type"])
         stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
         for url, contacts in results:
             host = urlsplit(url).hostname or ""

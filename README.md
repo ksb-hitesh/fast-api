@@ -8,6 +8,82 @@ tracks each URL through to confirmed removal.
 
 Nothing is ever sent automatically. You read every draft before it goes.
 
+---
+
+## Use it from your phone — the web app
+
+The same pipeline, behind one password-protected URL. Every step below has a button,
+a live progress log, and a **Your turn** panel listing what only you can do.
+
+Deploying it also solves the tunnel problem for free: Render's outbound IP is US, so
+there is no DNS poisoning and no SNI reset. **Preflight passes by default and you stop
+having to think about WireGuard.** That is the real reason to run it there.
+
+### Deploy to Render (free tier)
+
+1. **A database, so your evidence survives.** Render's free tier has no persistent
+   disk — the filesystem is wiped on every deploy, restart and idle spin-down, which
+   would destroy your RFC-3161 timestamps. Create a free
+   [MongoDB Atlas](https://www.mongodb.com/cloud/atlas/register) **M0** cluster
+   (512MB, free forever, no expiry) and copy the connection string.
+
+   Render has no static outbound IP, so Atlas → *Network Access* must allow
+   `0.0.0.0/0`. Security then rests entirely on the connection string: use a dedicated
+   database user with a long generated password.
+
+2. **Deploy.** Push this repo, then on Render: *New → Blueprint*, point it at the repo.
+   `render.yaml` does the rest. Set two environment variables when asked:
+
+   | Variable | |
+   |---|---|
+   | `APP_PASSWORD` | how you log in. The app refuses to start without it |
+   | `MONGODB_URI` | the Atlas string. Without it the instance is ephemeral and says so |
+
+3. **Open the URL on your phone** and log in. Add it to your home screen.
+
+Free tier notes: the service sleeps after 15 minutes of no traffic and takes ~50s to
+wake. While a step is running the page pings it, so nothing gets killed mid-capture —
+and a job keeps running server-side even if you lock your phone or close the tab.
+
+### Run it locally instead
+
+```bash
+APP_PASSWORD=whatever python -m uvicorn app:app --reload
+```
+
+Without `MONGODB_URI` it just uses the local `out/` directory, exactly like the CLI.
+Locally you still need the tunnel (see Step 0) — that requirement only disappears when
+it runs outside India.
+
+### What the web app adds
+
+- **Your turn** — a computed list of everything the tool cannot do for you: the
+  cybercrime portal, reading and sending each notice, web-form-only desks, de-indexing,
+  reverse-image searching, reviewing new copies, StopNCII. It shrinks as you tick
+  things off.
+- **One button per abuse desk** — *Open in mail* prefills your mail app, *Copy full
+  notice* puts the complete text on the clipboard (notices are ~4KB, which is past what
+  a `mailto:` link can carry — the app tells you when that happens instead of letting
+  your mail app truncate it silently), *Download .eml*, and *Mark sent*.
+- **A details form** that asks for your name, reply-to, postal address and which legal
+  grounds apply, before it writes anything — and enforces that a self-recorded (DMCA)
+  claim has a postal address, since it is sworn under penalty of perjury.
+- **A URL list editor**, so you can add a copy you found on your phone.
+- **Every report rendered** — STATUS, CANDIDATES, EMBEDS, DISCOVERY, FORMS,
+  SEARCH-ENGINES, the evidence manifest — plus a *Download all (.zip)*.
+
+Saved evidence pages are always served as downloads, never rendered in the browser:
+they are copies of the offending sites, and displaying one inside the app would show
+the material and give its scripts access to your session.
+
+Nothing about the safety design changes. No notice is ever sent for you, `--archive`
+stays off behind a warning, and nothing is added to your URL list without you
+selecting it.
+
+Checks: `python test_app.py` (offline, no network, no database needed).
+
+---
+
 ### Setup (once)
 
 ```bash

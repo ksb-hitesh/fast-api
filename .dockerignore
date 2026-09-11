@@ -1,0 +1,10 @@
+# Never bake secrets or local state into the image.
+cyber_secure.conf
+config.json
+urls.txt
+.env
+out/
+venv/
+.git/
+__pycache__/
+*.pyc

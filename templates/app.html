@@ -1,0 +1,167 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#14161a">
+<title>takedown</title>
+<link rel="stylesheet" href="/static/app.css">
+
+<header>
+  <strong>takedown</strong>
+  <span id="storage" class="pill"></span>
+  <form method="post" action="/logout" style="margin-left:auto">
+    <button class="ghost sm">Sign out</button>
+  </form>
+</header>
+
+<main>
+
+<!-- ───────────────────────────────── home ───────────────────────────────── -->
+<section id="p-home" class="panel">
+  <div class="card" id="counts-card">
+    <div class="row"><h2>Progress</h2><span id="urlcount" class="muted"></span></div>
+    <div id="counts" class="counts"></div>
+  </div>
+
+  <div class="card warn" id="todo-card">
+    <h2>Your turn <span id="todo-n" class="pill"></span></h2>
+    <p class="muted sm">Everything below needs a human. The tool cannot do these.</p>
+    <div id="todo"></div>
+  </div>
+
+  <div class="card">
+    <div class="row"><h2>URLs</h2>
+      <button class="ghost sm" onclick="go('files')">Full table</button></div>
+    <div id="minitable"></div>
+  </div>
+</section>
+
+<!-- ───────────────────────────────── steps ──────────────────────────────── -->
+<section id="p-steps" class="panel" hidden>
+  <div class="card" id="job-card" hidden>
+    <div class="row"><h2 id="job-title">Running</h2><span id="job-state" class="pill"></span></div>
+    <pre id="job-log" class="log"></pre>
+  </div>
+  <div id="steps"></div>
+</section>
+
+<!-- ───────────────────────────────── urls ───────────────────────────────── -->
+<section id="p-urls" class="panel" hidden>
+  <div class="card">
+    <h2>URL list</h2>
+    <p class="muted sm">One page URL per line. Lines starting with <code>#</code> are
+      ignored. This never leaves your instance or gets committed.</p>
+    <textarea id="urls-text" rows="14" spellcheck="false"
+              placeholder="https://example-site.com/video/12345"></textarea>
+    <button onclick="saveUrls()">Save</button>
+    <span id="urls-msg" class="muted sm"></span>
+  </div>
+</section>
+
+<!-- ─────────────────────────────── candidates ───────────────────────────── -->
+<section id="p-cand" class="panel" hidden>
+  <div class="card">
+    <h2>Copies you had not found yet</h2>
+    <p class="muted sm">Only <b>CONFIRMED</b> hits and video-file hosts reach this list.
+      Read them before adding — a notice about the wrong content costs you credibility
+      with the one desk that did act. Nothing is added automatically.</p>
+    <div id="cand-list"></div>
+    <div class="row">
+      <button onclick="appendCands()" id="cand-btn" disabled>Append selected</button>
+      <button class="ghost sm" onclick="toggleAllCands()">Select all</button>
+    </div>
+  </div>
+</section>
+
+<!-- ───────────────────────────────── notices ────────────────────────────── -->
+<section id="p-notices" class="panel" hidden>
+  <div class="card">
+    <div class="row"><h2>Abuse desks</h2>
+      <button class="ghost sm" onclick="openIdentity()">Edit your details</button></div>
+    <p class="muted sm">Read every notice before it goes. Nothing is sent for you.</p>
+  </div>
+  <div id="notices"></div>
+</section>
+
+<!-- ───────────────────────────────── files ──────────────────────────────── -->
+<section id="p-files" class="panel" hidden>
+  <div class="card">
+    <div class="row"><h2>Reports</h2>
+      <a class="btn ghost sm" href="/download/zip">Download all (.zip)</a></div>
+    <div id="quicklinks"></div>
+  </div>
+  <div class="card"><h2>Every file</h2><div id="files"></div></div>
+  <div class="card" id="viewer-card" hidden>
+    <div class="row"><h2 id="viewer-title"></h2>
+      <button class="ghost sm" onclick="closeViewer()">Close</button></div>
+    <div id="viewer" class="rendered"></div>
+  </div>
+</section>
+
+</main>
+
+<nav>
+  <button data-go="home"    class="on">Home</button>
+  <button data-go="steps">Steps</button>
+  <button data-go="urls">URLs</button>
+  <button data-go="cand">Copies<span id="nav-cand" class="dot" hidden></span></button>
+  <button data-go="notices">Notices<span id="nav-not" class="dot" hidden></span></button>
+  <button data-go="files">Files</button>
+</nav>
+
+<!-- ───────────────────────────────── dialogs ────────────────────────────── -->
+<dialog id="identity">
+  <form method="dialog" onsubmit="return false">
+    <h2>Your details</h2>
+    <p class="muted sm">These go into every notice. They reach site operators.</p>
+
+    <label>Full name <span class="req">required</span>
+      <input id="f-name" autocomplete="name"></label>
+
+    <label>Reply-to email <span class="req">required</span>
+      <input id="f-email" type="email" autocomplete="email"></label>
+    <p class="muted sm">Don't use a work address — this reaches site operators.</p>
+
+    <label>Send from (optional, if different)
+      <input id="f-send_from" type="email"></label>
+
+    <label>Postal address <span id="postal-req" class="req" hidden>required</span>
+      <textarea id="f-postal" rows="3"></textarea></label>
+
+    <label class="check"><input type="checkbox" id="f-india" checked>
+      <span><b>India — IT Rules 2021, Rule 3(2)(b)</b><br>
+      <span class="muted sm">Removal within <b>2 hours</b> of your complaint, and loss
+      of Section 79 safe harbour if missed. Triggers on your complaint alone — no court
+      order needed. Leave this on.</span></span></label>
+
+    <label class="check"><input type="checkbox" id="f-self_recorded">
+      <span><b>I filmed this myself</b><br>
+      <span class="muted sm">Only if you hold the copyright. Adds a DMCA §512(c) claim
+      sworn under penalty of perjury, so a postal address becomes mandatory. If someone
+      else recorded it, leave this off — the notice runs on NCII grounds and is still
+      strong.</span></span></label>
+
+    <label class="check"><input type="checkbox" id="f-eu">
+      <span><b>EU — GDPR Article 17</b><br>
+      <span class="muted sm">Adds an erasure demand.</span></span></label>
+
+    <label>Cybercrime portal acknowledgement number
+      <input id="f-portal_ack" placeholder="from cybercrime.gov.in"></label>
+
+    <p id="ident-err" class="err" hidden></p>
+    <div class="row">
+      <button onclick="saveIdentity()">Save</button>
+      <button class="ghost" onclick="identity.close()">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="confirm">
+  <h2 id="c-title"></h2>
+  <div id="c-body"></div>
+  <div class="row">
+    <button id="c-ok" class="danger">Continue</button>
+    <button class="ghost" onclick="confirm.close()">Cancel</button>
+  </div>
+</dialog>
+
+<script src="/static/app.js"></script>
