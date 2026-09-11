@@ -1,0 +1,934 @@
+#!/usr/bin/env python3
+"""Group NCII takedown URLs by abuse desk and write ready-to-send .eml drafts.
+
+    python takedown.py urls.txt --name "Full Name" --email me@example.com
+
+NEVER attach the video to these mails. URLs only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import csv
+import hashlib
+import json
+import re
+import socket
+import sys
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from email.utils import formatdate
+from pathlib import Path
+from urllib.parse import quote_plus, urlsplit
+
+import dns.asyncresolver
+import dns.exception
+import httpx
+from jinja2 import Environment, FileSystemLoader
+
+UA = "Mozilla/5.0 (compatible; NCII-takedown-reporter/1.0)"
+
+# Abuse desks that take a web form instead of mail. Matched against the RDAP
+# network name, so a site hiding behind a CDN gets routed to the CDN's form
+# rather than to a mailbox that will bounce.
+CDN_FORMS = {
+    "cloudflare": ("Cloudflare", "https://abuse.cloudflare.com/"),
+    "fastly": ("Fastly", "https://www.fastly.com/about/abuse/"),
+    "akamai": ("Akamai", "https://www.akamai.com/legal/compliance/report-abuse"),
+    "sucuri": ("Sucuri", "https://sucuri.net/abuse/"),
+    "ddos-guard": ("DDoS-Guard", "https://ddos-guard.net/en/report"),
+    "stackpath": ("StackPath", "https://www.stackpath.com/legal/abuse/"),
+}
+
+SITE_PATHS = ["/dmca", "/abuse", "/legal", "/contact", "/takedown",
+              "/content-removal", "/2257", "/terms", "/"]
+EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]*\w")
+# Only mailboxes that plausibly reach a human who can remove content.
+GOOD_LOCAL = re.compile(r"dmca|abuse|legal|support|admin|takedown|removal|compliance|contact", re.I)
+
+SEARCH_ENGINES = """\
+# De-index the URLs (do this first — it kills most of the real-world harm)
+
+Google removes non-consensual explicit imagery from Search and, since 2026, accepts
+many URLs in one submission:
+  https://support.google.com/websearch/answer/16854698
+
+Bing content removal:
+  https://www.bing.com/webmasters/tools/contentremoval
+
+Also file with StopNCII.org — it hashes the video ON YOUR DEVICE (the file never
+leaves it) and partner platforms block re-uploads. This tool only kills the URLs you
+already know about; StopNCII is what stops new ones appearing:
+  https://stopncii.org/
+
+## Paste this list into the bulk form
+
+{urls}
+"""
+
+
+TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+OG_IMAGE_RE = re.compile(
+    r"""<meta[^>]+(?:property|name)=["']og:image["'][^>]+content=["']([^"']+)""", re.I)
+OG_IMAGE_ALT_RE = re.compile(
+    r"""<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:image["']""", re.I)
+
+
+EVIDENCE_README = """\
+# Evidence
+
+Captured BEFORE the takedown notices went out, because a successful takedown
+destroys the proof that the material was ever there. Police, a lawyer or a civil
+claim will all ask for this.
+
+  MANIFEST.csv    one row per URL: when it was captured, the page title, the
+                  SHA-256 of the page, and the Wayback Machine copy
+  evidence.json   the same plus full HTTP response headers
+  *.html          the page markup exactly as served
+
+The `wayback` column is the important one. A file on your own disk is easy to
+dismiss; a dated copy held by an independent public archive is not.
+
+The video itself is deliberately NOT downloaded here. You do not need more copies
+of it, and no abuse desk will ask you for one.
+
+Do not edit these files. If this ever goes to court, their being untouched is the
+point. Keep a second copy somewhere else.
+"""
+
+DISCOVERY_HEADER = """\
+# Finding copies you haven't found yet
+
+A first pass usually finds well under half of what is out there. These links are
+built from the page titles and thumbnails already on the pages you reported.
+
+Work through them by hand. That is deliberate - these sites block automated
+searching fast, and a banned IP costs you more than the clicking saves.
+
+Yandex is consistently the best of the three at reverse image search on this kind
+of content. Try it first even though the interface is awkward.
+
+Add anything new you find to urls.txt and run the reporter again. Set up a Google
+Alert on your own name and on any distinctive title text while you are at it.
+"""
+
+ESCALATE_INDIA = """\
+# Escalation - the {deadline} deadline passed
+
+Work down this list IN ORDER. File the portal complaint before you send the second
+notices - those notices say a report is being made, and it should be true when they
+land.
+
+## 1. National Cyber Crime Reporting Portal (do this first)
+
+  https://cybercrime.gov.in/
+
+File under "Report Women/Child Related Crime" - it accepts anonymous reports and
+does not require you to go to a police station first. Attach evidence/MANIFEST.csv
+and the Wayback links. Keep the acknowledgement number.
+
+## 2. Send the second notices in this folder
+
+## 3. The platform's Grievance Officer
+
+Every intermediary serving India must publish one under Rule 3(2) of the IT Rules
+2021. It is usually at /grievance, /grievance-officer or in the privacy policy.
+They are bound to acknowledge within 7 days and, for this category, to have acted
+within two hours. Cite the missed deadline.
+
+## 4. MeitY
+
+Non-compliance with Rule 3(2)(b) costs the intermediary its Section 79 safe
+harbour. Say so plainly, and copy MeitY on the correspondence.
+
+## 5. Upstream and registry
+
+If the host itself is unresponsive, go above it: the upstream network operator
+shown in LOG.csv, then the domain registry above the registrar. Ask each to act on
+their own AUP.
+
+## 6. Get a lawyer involved
+
+A notice on law-firm letterhead moves hosts that ignore individuals. If the
+material is still up after the steps above, this is the step that works.
+
+## URLs still live
+
+{urls}
+"""
+
+ESCALATE_US = """\
+# Escalation - the {deadline} deadline passed
+
+Work down this list IN ORDER. File the FTC complaint before you send the second
+notices - those notices say a complaint is being filed, and it should be true when
+they land.
+
+## 1. FTC complaint (do this first)
+
+  https://reportfraud.ftc.gov/
+
+Section 3 of the TAKE IT DOWN Act is FTC-enforceable and has been since 19 May
+2026. Failure to remove within 48 hours of a valid request is exactly what the
+complaint portal is for. Attach evidence/MANIFEST.csv.
+
+## 2. Upstream and registry
+
+Go above the host: the upstream network operator in LOG.csv, then the domain
+registry above the registrar.
+
+## 4. Cyber Civil Rights Initiative
+
+  https://cybercivilrights.org/ - crisis helpline and direct platform contacts
+  that individuals do not have.
+
+## 5. Get a lawyer involved
+
+A notice on law-firm letterhead moves hosts that ignore individuals.
+
+## URLs still live
+
+{urls}
+"""
+
+
+def jinja_env() -> Environment:
+    return Environment(loader=FileSystemLoader(Path(__file__).parent),
+                       autoescape=False, trim_blocks=True, lstrip_blocks=True)
+
+
+@dataclass(frozen=True)
+class Contact:
+    kind: str      # hosting | registrar | site
+    provider: str
+    address: str   # email address, or form URL
+    type: str      # "email" | "form"
+
+
+# ---------------------------------------------------------------- lookups
+
+async def abusix_emails(ip: str) -> list[str]:
+    """Hosting abuse contact for an IP, via Abusix's free DNS ContactDB."""
+    # ponytail: IPv4 only. Abusix keys IPv6 in nibble format; add if a site turns
+    # out to be v6-only, which is vanishingly rare for tube sites.
+    if ":" in ip:
+        return []
+    name = ".".join(reversed(ip.split("."))) + ".abuse-contacts.abusix.zone"
+    try:
+        answer = await dns.asyncresolver.resolve(name, "TXT", lifetime=10)
+    except (dns.exception.DNSException, ValueError):
+        return []
+    out = []
+    for rr in answer:
+        for part in b"".join(rr.strings).decode(errors="ignore").split(","):
+            part = part.strip().lower()
+            if "@" in part:
+                out.append(part)
+    return out
+
+
+def _vcard(entity: dict, key: str) -> list[str]:
+    values = []
+    for item in (entity.get("vcardArray") or [None, []])[1]:
+        if isinstance(item, list) and len(item) >= 4 and item[0] == key:
+            v = item[3]
+            values.extend(v if isinstance(v, list) else [v])
+    return [v for v in values if isinstance(v, str) and v]
+
+
+def _walk(entities) -> list[dict]:
+    """RDAP nests entities inside entities; abuse contacts hide at any depth."""
+    found = []
+    for e in entities or []:
+        if isinstance(e, dict):
+            found.append(e)
+            found.extend(_walk(e.get("entities")))
+    return found
+
+
+def _abuse_emails(data: dict) -> list[str]:
+    out = []
+    for e in _walk(data.get("entities")):
+        if "abuse" in [r.lower() for r in e.get("roles") or []]:
+            out.extend(a.lower() for a in _vcard(e, "email") if "@" in a)
+    return out
+
+
+async def rdap(client: httpx.AsyncClient, path: str) -> dict:
+    try:
+        r = await client.get(f"https://rdap.org/{path}")
+        if r.status_code == 200:
+            return r.json()
+    except (httpx.HTTPError, ValueError):
+        pass
+    return {}
+
+
+async def hosting_contacts(client: httpx.AsyncClient, ip: str) -> list[Contact]:
+    data = await rdap(client, f"ip/{ip}")
+    net = (data.get("name") or "") + " " + str(data.get("remarks") or "")
+    provider = data.get("name") or f"network holding {ip}"
+
+    for needle, (label, form) in CDN_FORMS.items():
+        if needle in net.lower():
+            # Behind a CDN: the real host is masked, so report to the CDN's form.
+            return [Contact("hosting", f"{label} (CDN — origin host is masked)", form, "form")]
+
+    addrs = dict.fromkeys(_abuse_emails(data) + await abusix_emails(ip))
+    return [Contact("hosting", provider, a, "email") for a in addrs]
+
+
+async def registrar_contacts(client: httpx.AsyncClient, hostname: str) -> list[Contact]:
+    """Walk up the labels until RDAP recognises a registered domain."""
+    labels = hostname.removeprefix("www.").split(".")
+    for i in range(len(labels) - 1):
+        data = await rdap(client, "domain/" + ".".join(labels[i:]))
+        if not data:
+            continue
+        provider = next(
+            (n for e in _walk(data.get("entities"))
+             if "registrar" in [r.lower() for r in e.get("roles") or []]
+             for n in _vcard(e, "fn")),
+            "the registrar",
+        )
+        return [Contact("registrar", provider, a, "email")
+                for a in dict.fromkeys(_abuse_emails(data))]
+    return []
+
+
+async def site_contacts(client: httpx.AsyncClient, hostname: str) -> list[Contact]:
+    """The site's own DMCA desk — usually the fastest route on tube sites."""
+    found: dict[str, None] = {}
+    for path in SITE_PATHS:
+        try:
+            r = await client.get(f"https://{hostname}{path}")
+        except httpx.HTTPError:
+            continue
+        if r.status_code != 200:
+            continue
+        for addr in EMAIL_RE.findall(r.text):
+            local, _, domain = addr.lower().partition("@")
+            if GOOD_LOCAL.search(local) and hostname.removeprefix("www.") in domain:
+                found[addr.lower()] = None
+    return [Contact("site", f"{hostname} (site operator)", a, "email") for a in found]
+
+
+async def lookup_host(client: httpx.AsyncClient, hostname: str) -> tuple[str, list[Contact]]:
+    try:
+        ip = await asyncio.to_thread(socket.gethostbyname, hostname)
+    except OSError:
+        return "", []
+    host, reg, site = await asyncio.gather(
+        hosting_contacts(client, ip),
+        registrar_contacts(client, hostname),
+        site_contacts(client, hostname),
+    )
+    return ip, host + reg + site
+
+
+# ---------------------------------------------------------------- status table
+
+STATUS_FIELDS = ["url", "hostname", "first_seen_utc", "evidence_utc", "page_sha256",
+                 "wayback", "reported_utc", "deadline_utc", "contacts", "followup_utc",
+                 "last_checked_utc", "http_status", "check_note", "removed_utc"]
+
+# Phrases sites put up in place of a removed video. Deliberately conservative:
+# a false "REMOVED" is worse than an unknown, because you stop chasing.
+GONE_MARKERS = re.compile(
+    r"video (?:has been |was )?(?:removed|deleted|taken down)|no longer available|"
+    r"content (?:is )?(?:unavailable|removed)|page not found|this video does not exist|"
+    r"has been removed|404 not found", re.I)
+
+
+def now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load_status(out: Path) -> dict[str, dict]:
+    f = out / "STATUS.csv"
+    if not f.exists():
+        return {}
+    with f.open(newline="") as fh:
+        return {r["url"]: {k: r.get(k, "") for k in STATUS_FIELDS}
+                for r in csv.DictReader(fh)}
+
+
+def update_status(out: Path, updates: dict[str, dict]) -> dict[str, dict]:
+    """Merge this step's facts into the one table that survives between runs."""
+    out.mkdir(parents=True, exist_ok=True)
+    rows = load_status(out)
+    for url, fields in updates.items():
+        row = rows.setdefault(url, dict.fromkeys(STATUS_FIELDS, ""))
+        if not row["url"]:
+            row.update(url=url, hostname=urlsplit(url).hostname or "",
+                       first_seen_utc=now_utc())
+        row.update({k: v for k, v in fields.items() if v != ""})
+    with (out / "STATUS.csv").open("w", newline="") as fh:
+        w = csv.DictWriter(fh, STATUS_FIELDS)
+        w.writeheader()
+        w.writerows(rows[u] for u in sorted(rows))
+    return rows
+
+
+def state_of(row: dict, now: datetime) -> str:
+    """Derived, never stored - so it can't go stale against the facts."""
+    if row.get("removed_utc"):
+        return "REMOVED"
+    if row.get("check_note") == "unclear":
+        return "UNCLEAR"
+    if row.get("followup_utc"):
+        return "CHASED"
+    if row.get("reported_utc"):
+        due = row.get("deadline_utc")
+        if due and now > datetime.fromisoformat(due):
+            return "OVERDUE"
+        return "REPORTED"
+    if row.get("evidence_utc"):
+        return "EVIDENCE"
+    return "NEW"
+
+
+def write_status_table(out: Path, rows: dict[str, dict]) -> None:
+    now = datetime.now(timezone.utc)
+    order = {"REMOVED": 0, "OVERDUE": 1, "CHASED": 2, "UNCLEAR": 3,
+             "REPORTED": 4, "EVIDENCE": 5, "NEW": 6}
+    items = sorted(rows.values(), key=lambda r: (order.get(state_of(r, now), 9), r["url"]))
+
+    counts: dict[str, int] = {}
+    for r in items:
+        counts[state_of(r, now)] = counts.get(state_of(r, now), 0) + 1
+
+    md = ["# Progress\n",
+          f"\nUpdated {now.isoformat(timespec='seconds')}\n",
+          "\n" + "  ".join(f"**{k}** {v}" for k, v in sorted(counts.items())) + "\n",
+          "\n| URL | State | Evidence | Reported | Deadline | Last check | Result |\n",
+          "|---|---|---|---|---|---|---|\n"]
+    for r in items:
+        short = r["url"] if len(r["url"]) <= 58 else r["url"][:55] + "..."
+        note = r["check_note"] or "-"
+        if r["http_status"]:
+            note = f"{note} ({r['http_status']})"
+        md.append("| [{u}]({full}) | {st} | {ev} | {rp} | {dl} | {lc} | {note} |\n".format(
+            u=short.replace("|", "%7C"), full=r["url"].replace("|", "%7C"),
+            st=state_of(r, now),
+            ev="yes" if r["evidence_utc"] else "-",
+            rp=r["reported_utc"][:16].replace("T", " ") or "-",
+            dl=r["deadline_utc"][:16].replace("T", " ") or "-",
+            lc=r["last_checked_utc"][:16].replace("T", " ") or "-",
+            note=note))
+    md.append("\n## What the states mean\n\n"
+              "- **NEW** - in the list, nothing done yet\n"
+              "- **EVIDENCE** - snapshot and Wayback copy taken, not yet reported\n"
+              "- **REPORTED** - notices sent, still inside the deadline\n"
+              "- **OVERDUE** - deadline passed, no removal. Run --followup\n"
+              "- **CHASED** - second notice sent. Work through followup/ESCALATE.md\n"
+              "- **UNCLEAR** - the check could not tell. Open it yourself and look\n"
+              "- **REMOVED** - confirmed gone by a check\n")
+    (out / "STATUS.md").write_text("".join(md))
+
+
+def print_status(rows: dict[str, dict]) -> None:
+    now = datetime.now(timezone.utc)
+    for r in sorted(rows.values(), key=lambda r: (state_of(r, now), r["url"])):
+        short = r["url"] if len(r["url"]) <= 52 else r["url"][:49] + "..."
+        print(f"  {state_of(r, now):9} {short:52} {r['check_note'] or ''}")
+
+
+# ---------------------------------------------------------------- checking
+
+async def check_one(client: httpx.AsyncClient, url: str, expect_sha: str) -> tuple[str, str]:
+    """Is it actually gone? Returns (http_status, verdict).
+
+    Anything genuinely ambiguous comes back "unclear" rather than "gone" - a false
+    all-clear is the one error that makes you stop chasing something still online.
+    """
+    try:
+        r = await client.get(url)
+    except httpx.HTTPError as e:
+        return "", f"unclear ({type(e).__name__})"
+
+    code = r.status_code
+    if code in (404, 410, 451):
+        return str(code), "gone"
+    if code in (401, 403, 429):
+        # Could be the takedown, could be anti-bot or geo-blocking. Don't guess.
+        return str(code), "unclear"
+    if code != 200:
+        return str(code), "unclear"
+
+    body = r.content
+    if expect_sha and hashlib.sha256(body).hexdigest() == expect_sha:
+        # Byte-identical to what we captured: definitively still up.
+        return "200", "still up (unchanged)"
+    text = body.decode(r.encoding or "utf-8", errors="replace")
+    if GONE_MARKERS.search(text):
+        return "200", "gone"
+    return "200", "still up (page changed)"
+
+
+async def run_check(args) -> int:
+    out = Path(args.out)
+    rows = load_status(out)
+    if not rows:
+        sys.exit(f"no {out}/STATUS.csv yet - run --evidence or a reporting pass first")
+
+    sem = asyncio.Semaphore(4)
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True,
+                                 headers={"User-Agent": UA}) as client:
+        async def one(url, row):
+            async with sem:
+                code, verdict = await check_one(client, url, row.get("page_sha256", ""))
+                return url, code, verdict
+        checked = await asyncio.gather(*(one(u, r) for u, r in rows.items()))
+
+    updates = {}
+    for url, code, verdict in checked:
+        note = "unclear" if verdict.startswith("unclear") else verdict
+        fields = {"last_checked_utc": now_utc(), "http_status": code, "check_note": note}
+        if verdict == "gone" and not rows[url].get("removed_utc"):
+            fields["removed_utc"] = now_utc()
+        updates[url] = fields
+
+    rows = update_status(out, updates)
+    write_status_table(out, rows)
+
+    gone = sum(1 for _, _, v in checked if v == "gone")
+    unclear = sum(1 for _, _, v in checked if v.startswith("unclear"))
+    print(f"\nchecked {len(checked)} URL(s): {gone} gone, "
+          f"{len(checked) - gone - unclear} still up, {unclear} unclear\n")
+    print_status(rows)
+    print(f"\nFull table: {out}/STATUS.md and {out}/STATUS.csv")
+    if unclear:
+        print("Open the 'unclear' ones yourself - the check could not tell, and it "
+              "will not guess.")
+    return 0
+
+
+# ---------------------------------------------------------------- evidence
+
+async def capture_one(client: httpx.AsyncClient, url: str, ev: Path) -> dict:
+    """Snapshot a page so proof survives the takedown that destroys it.
+
+    Saves the page markup, headers and a hash. Never downloads the video itself -
+    abuse desks don't need it and you should not be making more copies.
+    """
+    rec = {"url": url,
+           "captured_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    try:
+        r = await client.get(url)
+    except httpx.HTTPError as e:
+        rec["error"] = f"{type(e).__name__}: {e}"
+        return rec
+
+    body = r.content
+    name = slug(urlsplit(url).hostname + "-" + (urlsplit(url).path or "/"))
+    (ev / f"{name}.html").write_bytes(body)
+
+    text = body.decode(r.encoding or "utf-8", errors="replace")
+    title = TITLE_RE.search(text)
+    og = OG_IMAGE_RE.search(text) or OG_IMAGE_ALT_RE.search(text)
+    rec.update(
+        final_url=str(r.url), http_status=r.status_code, bytes=len(body),
+        sha256_of_page=hashlib.sha256(body).hexdigest(),
+        page_title=" ".join(title.group(1).split()) if title else "",
+        thumbnail=og.group(1) if og else "",
+        server=r.headers.get("server", ""), saved_as=f"{name}.html",
+        response_headers=dict(r.headers),
+    )
+    return rec
+
+
+async def archive_one(client: httpx.AsyncClient, url: str) -> str:
+    """Ask the Wayback Machine to keep a dated third-party copy.
+
+    A snapshot on your own disk is easy to dismiss; one held by an independent
+    archive with a timestamp is much harder to argue with.
+    """
+    try:
+        r = await client.get(f"https://web.archive.org/save/{url}", timeout=120)
+    except httpx.HTTPError:
+        return ""
+    loc = r.headers.get("content-location", "")
+    return f"https://web.archive.org{loc}" if loc else str(r.url)
+
+
+async def capture_evidence(client, urls: list[str], out: Path) -> list[dict]:
+    ev = out / "evidence"
+    ev.mkdir(parents=True, exist_ok=True)
+    sem = asyncio.Semaphore(4)
+
+    async def one(u):
+        async with sem:
+            print(f"  capturing {u} ...", file=sys.stderr)
+            rec = await capture_one(client, u, ev)
+            rec["wayback"] = await archive_one(client, u)
+            return rec
+
+    records = list(await asyncio.gather(*(one(u) for u in urls)))
+    (ev / "evidence.json").write_text(json.dumps(records, indent=2, sort_keys=True))
+
+    with (ev / "MANIFEST.csv").open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["captured_at_utc", "url", "http_status", "page_title",
+                    "sha256_of_page", "saved_as", "wayback", "error"])
+        for r in records:
+            w.writerow([r.get("captured_at_utc", ""), r["url"], r.get("http_status", ""),
+                        r.get("page_title", ""), r.get("sha256_of_page", ""),
+                        r.get("saved_as", ""), r.get("wayback", ""), r.get("error", "")])
+
+    (ev / "README.md").write_text(EVIDENCE_README)
+    return records
+
+
+# ---------------------------------------------------------------- discovery
+
+def write_discovery(records: list[dict], out: Path) -> None:
+    """Links to hunt for copies you have not found yet.
+
+    Deliberately manual: these sites block automated scraping quickly, and getting
+    your IP banned mid-search costs more than the clicking saves.
+    """
+    lines = [DISCOVERY_HEADER]
+    for rec in records:
+        title, thumb = rec.get("page_title", ""), rec.get("thumbnail", "")
+        lines.append(f"\n## {rec['url']}\n")
+        if title:
+            q = quote_plus(f'"{title}"')
+            lines.append(f"Page title: {title}\n")
+            lines.append(f"- Search the exact title: https://www.google.com/search?q={q}\n")
+            lines.append(f"- Same, on Bing: https://www.bing.com/search?q={q}\n")
+            lines.append(f"- Same, on Yandex (indexes these sites more deeply): "
+                         f"https://yandex.com/search/?text={q}\n")
+        if thumb:
+            t = quote_plus(thumb)
+            lines.append(f"\nThumbnail found on the page: {thumb}\n")
+            lines.append(f"- Reverse image search (Google Lens): "
+                         f"https://lens.google.com/uploadbyurl?url={t}\n")
+            lines.append(f"- Reverse image search (Yandex, best of the three for this): "
+                         f"https://yandex.com/images/search?rpt=imageview&url={t}\n")
+            lines.append(f"- Reverse image search (Bing): "
+                         f"https://www.bing.com/images/search?view=detailv2&iss=sbi&q=imgurl:{t}\n")
+        if not title and not thumb:
+            lines.append("Nothing extractable from this page - search manually.\n")
+    (out / "DISCOVERY.md").write_text("".join(lines))
+
+
+# ---------------------------------------------------------------- follow-up
+
+def overdue_rows(out: Path, hours: float) -> dict[str, dict]:
+    """Contacts from a previous run whose deadline has passed."""
+    log = out / "LOG.csv"
+    if not log.exists():
+        sys.exit(f"no {log} - run a reporting pass first, then follow up on it")
+    now = datetime.now(timezone.utc)
+    # Anything a check already confirmed gone must not be chased again - sending a
+    # second notice about content that is already down destroys your credibility
+    # with the one desk that actually acted.
+    done = {u for u, r in load_status(out).items() if r.get("removed_utc")}
+    groups: dict[str, dict] = {}
+    with log.open(newline="") as fh:
+        for row in csv.DictReader(fh):
+            if row["contact_type"] != "email" or not row["contact"]:
+                continue
+            if row["url"] in done:
+                continue
+            sent = datetime.fromisoformat(row["logged_at_utc"])
+            age = (now - sent).total_seconds() / 3600
+            if age < hours:
+                continue
+            g = groups.setdefault(row["contact"], {
+                "provider": row["provider"] or row["contact"],
+                "urls": [], "first_sent": sent, "age": age})
+            g["first_sent"] = min(g["first_sent"], sent)
+            g["age"] = max(g["age"], age)
+            if row["url"] not in g["urls"]:
+                g["urls"].append(row["url"])
+    return groups
+
+
+def write_followup(args, groups: dict, out: Path, hours: float) -> None:
+    env = jinja_env()
+    fu = out / "followup"
+    fu.mkdir(parents=True, exist_ok=True)
+    for n, (addr, g) in enumerate(sorted(groups.items()), 1):
+        body = env.get_template("escalation.j2").render(
+            provider=g["provider"], urls=g["urls"], name=args.name, email=args.email,
+            india=args.india, elapsed=f"{g['age']:.0f} hours",
+            first_sent=g["first_sent"].strftime("%d %B %Y %H:%M UTC"),
+            date=datetime.now(timezone.utc).strftime("%d %B %Y"))
+        msg = EmailMessage()
+        msg["Subject"] = (f"SECOND NOTICE - NCII removal deadline missed - "
+                          f"{len(g['urls'])} URL(s) still live")
+        msg["To"] = addr
+        msg["From"] = args.send_from or args.email
+        msg["Date"] = formatdate(localtime=True)
+        msg.set_content(body)
+        (fu / f"{n:02d}-{slug(addr)}.eml").write_bytes(msg.as_bytes())
+
+    (fu / "ESCALATE.md").write_text(
+        (ESCALATE_INDIA if args.india else ESCALATE_US).format(
+            deadline=f"{hours:g} hours",
+            urls="\n".join(f"  {u}" for g in groups.values() for u in g["urls"])))
+
+
+# ---------------------------------------------------------------- grouping
+
+def group_contacts(results: list[tuple[str, list[Contact]]]) -> dict[str, dict]:
+    """{address: {provider, type, kinds, urls}} — one entry per abuse desk.
+
+    This is the whole point of the tool: one mail to a provider listing every URL
+    it hosts, instead of one mail per URL.
+    """
+    groups: dict[str, dict] = {}
+    for url, contacts in results:
+        for c in contacts:
+            g = groups.setdefault(
+                c.address.lower(),
+                {"provider": c.provider, "type": c.type, "kinds": set(), "urls": []},
+            )
+            g["kinds"].add(c.kind)
+            if url not in g["urls"]:
+                g["urls"].append(url)
+    return groups
+
+
+def slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9._-]+", "-", text.lower()).strip("-")[:60]
+
+
+# ---------------------------------------------------------------- output
+
+def deadline_text(args) -> str:
+    # India's Rule 3(2)(b) window is two hours; the US TAKE IT DOWN duty is 48.
+    return "2 hours" if args.india else "48 hours"
+
+
+def render(env, args, provider: str, urls: list[str], role: str = "hosting") -> str:
+    return env.get_template("notice.j2").render(
+        provider=provider, urls=urls, role=role, name=args.name, email=args.email,
+        postal=args.postal, self_recorded=args.self_recorded, eu=args.eu,
+        india=args.india, deadline=deadline_text(args),
+        date=datetime.now(timezone.utc).strftime("%d %B %Y"),
+    )
+
+
+def write_outputs(args, results, groups, ips: dict, out: Path) -> None:
+    env = jinja_env()
+    out.mkdir(parents=True, exist_ok=True)
+    forms = []
+
+    n = 0
+    for addr, g in sorted(groups.items()):
+        # A desk reached through several routes is addressed by the narrowest one
+        # that fits: a registrar can only suspend a domain, not delete a file.
+        role = ("registrar" if g["kinds"] == {"registrar"}
+                else "site" if g["kinds"] == {"site"} else "hosting")
+        body = render(env, args, g["provider"], g["urls"], role)
+        subject = (f"URGENT - Non-consensual intimate imagery (NCII) takedown request "
+                   f"- removal required within {deadline_text(args)} "
+                   f"- {len(g['urls'])} URL(s)")
+        if g["type"] == "form":
+            forms.append((g["provider"], addr, g["urls"], subject, body))
+            continue
+        n += 1
+        msg = EmailMessage()
+        msg["Subject"] = subject
+        msg["To"] = addr
+        msg["From"] = args.send_from or args.email
+        msg["Date"] = formatdate(localtime=True)
+        msg.set_content(body)
+        (out / f"{n:02d}-{slug(addr)}.eml").write_bytes(msg.as_bytes())
+
+    if forms:
+        text = ["# Abuse desks that only take a web form\n",
+                "No email possible — open each link, paste the body below.\n"]
+        for provider, url, urls, subject, body in forms:
+            text.append(f"\n## {provider}\n\nForm: {url}\n\nCovers {len(urls)} URL(s).\n"
+                        f"\nSubject:\n\n    {subject}\n\nBody:\n\n```\n{body}\n```\n")
+        (out / "FORMS.md").write_text("".join(text))
+
+    all_urls = [u for u, _ in results]
+    (out / "SEARCH-ENGINES.md").write_text(
+        SEARCH_ENGINES.format(urls="\n".join(all_urls)))
+
+    with (out / "LOG.csv").open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["logged_at_utc", "url", "hostname", "ip", "kind", "provider",
+                    "contact", "contact_type"])
+        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        for url, contacts in results:
+            host = urlsplit(url).hostname or ""
+            if not contacts:
+                w.writerow([stamp, url, host, "", "NONE FOUND", "", "", ""])
+            for c in contacts:
+                w.writerow([stamp, url, host, ips.get(host, ""), c.kind,
+                            c.provider, c.address, c.type])
+
+
+
+# ---------------------------------------------------------------- main
+
+def read_urls(path: str) -> list[str]:
+    lines = [ln.strip() for ln in Path(path).read_text().splitlines()]
+    urls = [u for u in lines if u and not u.startswith("#")]
+    if not urls:
+        sys.exit(f"no URLs in {path} - add the page URLs, one per line")
+    return urls
+
+
+async def run_followup(args) -> int:
+    out = Path(args.out)
+    hours = 2.0 if args.india else 48.0
+    groups = overdue_rows(out, hours)
+    if not groups:
+        print(f"nothing past the {hours:g}-hour deadline yet. Check again later.")
+        return 0
+    write_followup(args, groups, out, hours)
+    chased = now_utc()
+    rows = update_status(out, {u: {"followup_utc": chased}
+                               for g in groups.values() for u in g["urls"]})
+    write_status_table(out, rows)
+    print(f"\n{len(groups)} desk(s) past the {hours:g}-hour deadline "
+          f"-> second notices in {out}/followup/")
+    for addr, g in sorted(groups.items()):
+        print(f"  {addr:45} {len(g['urls'])} URL(s)  {g['age']:.0f}h ago")
+    print(f"\nSend those, then work through {out}/followup/ESCALATE.md.")
+    print(f"Progress table: {out}/STATUS.md")
+    return 0
+
+
+async def run_evidence(args) -> int:
+    urls = read_urls(args.urls)
+    out = Path(args.out)
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True,
+                                 headers={"User-Agent": UA}) as client:
+        records = await capture_evidence(client, urls, out)
+    write_discovery(records, out)
+    rows = update_status(out, {
+        r["url"]: {"evidence_utc": r.get("captured_at_utc", ""),
+                   "page_sha256": r.get("sha256_of_page", ""),
+                   "wayback": r.get("wayback", "")}
+        for r in records if not r.get("error")})
+    write_status_table(out, rows)
+    ok = [r for r in records if not r.get("error")]
+    archived = [r for r in ok if r.get("wayback")]
+    print(f"\ncaptured {len(ok)}/{len(urls)} page(s) -> {out}/evidence/")
+    print(f"archived {len(archived)}/{len(urls)} to the Wayback Machine")
+    for r in records:
+        if r.get("error"):
+            print(f"  !! could not capture {r['url']}: {r['error']}")
+        elif not r.get("wayback"):
+            print(f"  !  no Wayback copy for {r['url']} - save it manually at "
+                  f"https://web.archive.org/save/")
+    print(f"\nLeads for finding more copies: {out}/DISCOVERY.md")
+    print(f"Progress table: {out}/STATUS.md")
+    print("Keep a second copy of the evidence folder somewhere else.")
+    return 0
+
+
+async def run(args) -> int:
+    urls = read_urls(args.urls)
+
+    bad = [u for u in urls if not urlsplit(u).hostname]
+    if bad:
+        sys.exit("these lines have no hostname — full https://... URLs are required:\n  "
+                 + "\n  ".join(bad))
+    hosts = list(dict.fromkeys(urlsplit(u).hostname for u in urls))
+
+    sem = asyncio.Semaphore(5)  # be polite to RDAP servers
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True,
+                                 headers={"User-Agent": UA}) as client:
+        async def one(h):
+            async with sem:
+                print(f"  looking up {h} ...", file=sys.stderr)
+                return h, await lookup_host(client, h)
+        per_host = dict(await asyncio.gather(*(one(h) for h in hosts)))
+
+    ips = {h: ip for h, (ip, _) in per_host.items()}
+    results = [(u, per_host[urlsplit(u).hostname][1]) for u in urls]
+
+    groups = group_contacts(results)
+    out = Path(args.out)
+    write_outputs(args, results, groups, ips, out)
+
+    sent = datetime.now(timezone.utc)
+    due = sent + timedelta(hours=2 if args.india else 48)
+    rows = update_status(out, {
+        url: {"reported_utc": sent.isoformat(timespec="seconds"),
+              "deadline_utc": due.isoformat(timespec="seconds"),
+              "contacts": "; ".join(dict.fromkeys(c.address for c in contacts))
+                          or "NONE FOUND"}
+        for url, contacts in results})
+    write_status_table(out, rows)
+
+    emails = sum(1 for g in groups.values() if g["type"] == "email")
+    print(f"\n{len(urls)} URL(s) across {len(hosts)} host(s) -> {emails} email draft(s) in {out}/")
+    for addr, g in sorted(groups.items()):
+        print(f"  [{g['type']:5}] {addr:45} {len(g['urls'])} URL(s)  ({', '.join(sorted(g['kinds']))})")
+
+    orphans = [u for u, c in results if not c]
+    if orphans:
+        print("\n!! NO CONTACT FOUND — these need manual work, do not lose them:")
+        for u in orphans:
+            print(f"   {u}")
+    print(f"\nProgress table: {out}/STATUS.md  (deadline {due.strftime('%H:%M UTC')})")
+    print("\nRead every draft before sending. Never attach the video.")
+    print(f"Start with {out}/SEARCH-ENGINES.md — de-indexing helps fastest.")
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("urls", nargs="?", help="file with one URL per line (# comments ok)")
+    p.add_argument("--name", help="your full legal name, for the notice")
+    p.add_argument("--email", help="contact address for replies")
+    p.add_argument("--send-from", help="address to send from, if different from --email")
+    p.add_argument("--postal", default="", help="postal address (DMCA notices require one)")
+    p.add_argument("--self-recorded", action="store_true",
+                   help="you filmed it yourself, so you own the copyright: adds the "
+                        "DMCA 512(c) claim and its sworn statement. Leave OFF if someone "
+                        "else recorded it.")
+    p.add_argument("--eu", action="store_true", help="add a GDPR Art. 17 erasure demand")
+    p.add_argument("--india", action="store_true",
+                   help="lead with Rule 3(2)(b) of the IT Rules 2021 as amended in 2026: "
+                        "2-hour removal on your complaint, and loss of Section 79 safe "
+                        "harbour if they miss it. Much sharper than the US 48-hour duty.")
+    p.add_argument("--evidence", action="store_true",
+                   help="capture proof first: page markup, hashes and a Wayback copy per "
+                        "URL, plus DISCOVERY.md. DO THIS BEFORE REPORTING - a successful "
+                        "takedown destroys the evidence.")
+    p.add_argument("--check", action="store_true",
+                   help="re-fetch every URL in STATUS.csv and record whether it is "
+                        "actually gone. Safe to re-run as often as you like.")
+    p.add_argument("--followup", action="store_true",
+                   help="read out/LOG.csv, find who blew the deadline, draft second "
+                        "notices and an escalation checklist")
+    p.add_argument("--out", default="out", help="output directory (default: out)")
+    args = p.parse_args()
+
+    if args.evidence:
+        if not args.urls:
+            sys.exit("--evidence needs the URL file")
+        return asyncio.run(run_evidence(args))
+    if args.check:
+        return asyncio.run(run_check(args))
+    if args.followup:
+        if not (args.name and args.email):
+            sys.exit("--followup needs --name and --email for the second notices")
+        return asyncio.run(run_followup(args))
+
+    missing = [f for f in ("urls", "name", "email") if not getattr(args, f)]
+    if missing:
+        sys.exit("missing required argument(s): " + ", ".join(missing))
+    if args.self_recorded and not args.postal:
+        sys.exit("--self-recorded sends a sworn DMCA notice, which must carry a postal "
+                 "address. Pass --postal.")
+    return asyncio.run(run(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

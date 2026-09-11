@@ -1,0 +1,56 @@
+{# Second notice, sent when the first deadline passed with no removal. #}
+To the Abuse Team at {{ provider }},
+
+This is a second notice. On {{ first_sent }} I reported non-consensual intimate
+imagery depicting me at the URLs below. The removal deadline has passed and the
+material is still accessible.
+
+REPORTER
+    Name:  {{ name }}
+    Email: {{ email }}
+    Date:  {{ date }}
+    Elapsed since first notice: {{ elapsed }}
+
+URLS STILL LIVE ({{ urls|length }})
+
+{% for u in urls %}
+    {{ u }}
+{% endfor %}
+
+{% if india %}
+You were required to act within two hours under Rule 3(2)(b) of the Information
+Technology (Intermediary Guidelines and Digital Media Ethics Code) Rules, 2021 as
+amended by G.S.R. 120(E) of 10 February 2026. That window has closed. On this
+record you no longer hold the safe harbour that Section 79 of the Information
+Technology Act, 2000 would otherwise afford you in respect of this material.
+
+This failure is being reported to the National Cyber Crime Reporting Portal
+(cybercrime.gov.in), and this correspondence is being retained for the Ministry of
+Electronics and Information Technology.
+{% else %}
+You were required to act within 48 hours under Section 3 of the TAKE IT DOWN Act
+(Pub. L. No. 119-12). That window has closed. Non-compliance is enforceable by the
+Federal Trade Commission, which is treating failures under this section as
+actionable and has opened a complaint portal for exactly this situation. A
+complaint recording this non-compliance is being filed.
+{% endif %}
+
+I have preserved timestamped evidence of the material, of my original notice, and
+of its continued availability after the deadline.
+
+I require, immediately:
+
+    1. Removal of every URL above and any known identical copies.
+    2. Written confirmation of the action taken and its date.
+    3. The name and contact details of the person or office accountable for this
+       failure, and your ticket reference.
+
+If this material remains accessible, I will escalate to your upstream network
+provider, to the domain registry, and to the regulator, and will pursue the civil
+and criminal remedies available to me.
+
+    Signed: {{ name }}
+    Date:   {{ date }}
+
+{{ name }}
+{{ email }}

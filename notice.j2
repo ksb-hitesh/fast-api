@@ -1,0 +1,138 @@
+{#
+  The notice body. Edit the wording freely - it is plain text on purpose.
+  NEVER attach the video to these mails. URLs only. Abuse desks do not need,
+  and must not be sent, a copy of the material.
+#}
+To the Abuse Team at {{ provider }},
+
+{% if role == 'registrar' %}
+I am writing to report non-consensual intimate imagery (NCII) depicting me that is
+being distributed from a domain you sponsor, and to request your urgent intervention.
+{% elif role == 'site' %}
+I am writing to report non-consensual intimate imagery (NCII) depicting me that is
+published on your service, and to request its urgent removal.
+{% else %}
+I am writing to report non-consensual intimate imagery (NCII) depicting me that is
+being distributed on infrastructure you operate, and to request its urgent removal.
+{% endif %}
+
+REPORTER
+    Name:  {{ name }}
+    Email: {{ email }}
+{% if postal %}
+    Address: {{ postal }}
+{% endif %}
+    Date:  {{ date }}
+
+I am the individual depicted in the material at the URLs listed below. This material
+was published and is being distributed without my consent. I have never authorised
+its publication, reproduction or distribution by the operator of this site or by any
+other party, and I do not consent to it now.
+
+URLS TO BE REMOVED ({{ urls|length }})
+
+{% for u in urls %}
+    {{ u }}
+{% endfor %}
+
+LEGAL BASIS
+
+{% if self_recorded %}
+Copyright - 17 U.S.C. Section 512(c). I created the material myself and am the sole
+owner of the copyright in it. No licence to reproduce, display, perform or distribute
+it has ever been granted to anyone. This letter is a formal notification of claimed
+infringement under Section 512(c)(3), and the statements required by that subsection
+appear at the end of this notice.
+
+{% endif %}
+{% if india %}
+Information Technology Rules - Rule 3(2)(b) of the Information Technology
+(Intermediary Guidelines and Digital Media Ethics Code) Rules, 2021, as amended by
+the Information Technology (Intermediary Guidelines and Digital Media Ethics Code)
+Amendment Rules, 2026, notified as G.S.R. 120(E) on 10 February 2026 and in force
+from 20 February 2026.
+
+On a complaint by the individual depicted, an intermediary must remove or disable
+access to content that exposes a person's private areas, shows them in full or
+partial nudity or in a sexual act, or that has been artificially morphed to suggest
+the same, WITHIN TWO HOURS of that complaint. The 2026 amendment cut this window
+from twenty-four hours to two. This notice is that complaint, and the two-hour
+period runs from your receipt of it.
+
+Failure to act within that window costs you the protection from liability that
+Section 79 of the Information Technology Act, 2000 would otherwise give you.
+Publication of this material is separately an offence under Sections 66E, 67 and
+67A of that Act.
+
+I am filing this complaint in parallel with the National Cyber Crime Reporting
+Portal at cybercrime.gov.in. Please also provide the name and contact details of
+the Grievance Officer you are required to appoint under Rule 3(2), together with
+your ticket reference for this complaint.
+
+{% endif %}
+TAKE IT DOWN Act - Section 3 of the TAKE IT DOWN Act (Pub. L. No. 119-12). The
+notice-and-removal duty under that section has been enforceable since 19 May 2026.
+On receipt of a valid request from an identifiable individual depicted in a
+non-consensual intimate image, a covered platform must remove the material, and any
+known identical copies of it, WITHIN 48 HOURS. The Federal Trade Commission enforces
+this provision and has already issued warning letters and opened its complaint portal
+for non-compliance. Please treat this notice as starting that 48-hour period.
+
+Knowing publication of non-consensual intimate imagery is also a federal criminal
+offence under Section 2 of the same Act.
+{% if eu %}
+
+GDPR Article 17 - to the extent you process my personal data within the scope of
+Regulation (EU) 2016/679, I additionally exercise my right to erasure. The material
+is special-category data under Article 9 concerning my sex life, processed without
+any lawful basis and without my consent. Article 12(3) requires a response without
+undue delay and in any event within one month.
+{% endif %}
+
+Independently of any of the above, this material almost certainly breaches your own
+acceptable use policy, which is sufficient grounds for you to act immediately.
+
+WHAT I AM ASKING FOR
+
+{% if role == 'registrar' %}
+    1. Require the registrant to remove the material at every URL listed above
+       within {{ deadline }}, and suspend the domain if they do not.
+{% else %}
+    1. Remove or disable access to the material at every URL listed above, and to
+       any known identical copies, within {{ deadline }}.
+{% endif %}
+    2. Confirm to me in writing what you removed and on what date.
+    3. Preserve server logs and uploader records relating to this material. I am
+       pursuing this further and those records may be required.
+    4. Do not disclose my name, email or any part of this notice to the uploader or
+       to the site operator beyond what is strictly necessary to effect removal.
+
+If you are not the correct party - for example if you are a reseller, a CDN, or the
+upstream of the network actually hosting these files - please forward this notice to
+the responsible party and tell me who they are, so I can address them directly.
+{% if self_recorded %}
+
+STATEMENTS REQUIRED BY 17 U.S.C. SECTION 512(c)(3)
+
+I have a good faith belief that the use of the material in the manner complained of
+above is not authorised by me as the copyright owner, by my agent, or by law.
+
+I swear, under penalty of perjury, that the information in this notification is
+accurate and that I am the owner of an exclusive right that is allegedly infringed,
+or am authorised to act on that owner's behalf.
+
+    Signed: {{ name }}
+    Date:   {{ date }}
+{% else %}
+
+I confirm that the information in this notice is accurate and that I am the
+individual depicted in the material identified above.
+
+    Signed: {{ name }}
+    Date:   {{ date }}
+{% endif %}
+
+Please acknowledge receipt of this notice.
+
+{{ name }}
+{{ email }}
