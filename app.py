@@ -468,7 +468,10 @@ async def api_run(request: Request, step: str):
     if step in NEEDS_IDENTITY and cfg.get("self_recorded") and not cfg.get("postal"):
         raise HTTPException(400, "a postal address is required for a self-recorded "
                                  "(DMCA) claim - it is sworn under penalty of perjury")
-    if step in {"preflight", "evidence", "report"} and not _url_count():
+    picked = [u for u in (body.get("urls") or []) if u.startswith("http")]
+    # A selection stands on its own - it may well be URLs the tracker knows and
+    # urls.txt does not, so the file being empty is not a reason to refuse.
+    if step in {"preflight", "evidence", "report"} and not (picked or _url_count()):
         raise HTTPException(400, "no URLs yet - add them first")
     if step == "followup" and not (OUT / "LOG.csv").exists():
         raise HTTPException(400, "no LOG.csv yet - generate and send notices first")
@@ -486,7 +489,7 @@ async def api_run(request: Request, step: str):
 
     ns = build_ns(cfg)
     if step in {"report", "check"}:
-        ns.only = [u for u in (body.get("urls") or []) if u.startswith("http")] or None
+        ns.only = picked or None
     _job = Job(step=step)
     _publish({"type": "start", "job": _job.as_dict()})
 

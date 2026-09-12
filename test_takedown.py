@@ -254,17 +254,45 @@ def test_read_urls_collapses_duplicates():
         assert read_urls(str(f)) == ["https://s.com/a", "https://s.com/b"]
 
 
-def test_subset_narrows_a_run_and_refuses_a_miss():
-    urls = ["https://s.com/a", "https://s.com/b"]
-    assert subset(urls, Namespace(only=None)) == urls
-    assert subset(urls, Namespace()) == urls
-    assert subset(urls, Namespace(only=["https://s.com/b"])) == ["https://s.com/b"]
-    try:
-        subset(urls, Namespace(only=["https://elsewhere.io/x"]))
-    except SystemExit:
-        pass
-    else:
-        raise AssertionError("a selection matching nothing must not run over everything")
+def test_subset_is_the_work_list_not_a_filter_over_urls_txt():
+    """The tracker holds URLs urls.txt does not: ones held back with a '#', and the
+    embeds a scan found on a page. Filtering the selection against the file made every
+    one of those fail with "none of the selected URLs are in the list"."""
+    assert subset(Namespace(only=None)) == []
+    assert subset(Namespace()) == []
+    orphan = "https://filehost.example/e/abc"
+    assert subset(Namespace(only=[orphan])) == [orphan]
+    assert subset(Namespace(only=[orphan, orphan])) == [orphan], "deduped"
+
+
+def test_reporting_a_url_that_is_not_in_urls_txt():
+    """The exact failure: select an embed the scan found, or a URL held back with a
+    '#', press Generate notices, and it must report it - not refuse."""
+    import takedown as T
+    orphan = "https://filehost.example/e/abc"
+
+    async def fake_lookup(client, host):
+        return "203.0.113.9", [Contact("hosting", "OVH", "abuse@ovh.net", "email")]
+
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d)
+        # urls.txt holds something else entirely, and has the orphan commented out
+        (out / "urls.txt").write_text(f"https://other.example/x\n# {orphan}\n")
+        assert orphan not in read_urls(str(out / "urls.txt"))
+        args = Namespace(urls=str(out / "urls.txt"), out=str(d), only=[orphan],
+                         name="A Person", email="a@b.com", send_from=None, postal="",
+                         self_recorded=False, eu=False, india=True,
+                         origin=False, use_ytdlp=False)
+        real, T.lookup_host = T.lookup_host, fake_lookup
+        try:
+            assert asyncio.run(T.run(args)) == 0
+        finally:
+            T.lookup_host = real
+
+        rows = load_status(out)
+        assert set(rows) == {orphan}, "only the selected URL is reported"
+        assert rows[orphan]["contacts"] == "abuse@ovh.net"
+        assert any("abuse-ovh.net" in p.name for p in out.glob("*.eml"))
 
 
 def test_clearing_undoes_what_update_status_cannot():

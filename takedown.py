@@ -710,9 +710,15 @@ async def check_one(client: httpx.AsyncClient, url: str, expect_sha: str) -> tup
 async def run_check(args) -> int:
     out = Path(args.out)
     rows = load_status(out)
+    picked = subset(args)
+    if picked:
+        # A selected URL with no row yet is still checkable: check_one() needs the URL,
+        # and the hash is only used to prove "byte-identical to what we captured".
+        rows = {u: rows.get(u) or dict(dict.fromkeys(STATUS_FIELDS, ""), url=u,
+                                       hostname=urlsplit(u).hostname or "")
+                for u in picked}
     if not rows:
         sys.exit(f"no {out}/STATUS.csv yet - run --evidence or a reporting pass first")
-    rows = {u: rows[u] for u in subset(rows, args)}
 
     sem = asyncio.Semaphore(4)
     async with httpx.AsyncClient(timeout=20, follow_redirects=True,
@@ -1140,15 +1146,15 @@ def write_outputs(args, results, groups, ips: dict, out: Path) -> None:
 
 # ---------------------------------------------------------------- main
 
-def subset(urls, args) -> list:
-    """Narrow a run to --only, when given. Anything not on the list is untouched."""
-    only = getattr(args, "only", None)
-    if not only:
-        return list(urls)
-    picked = [u for u in urls if u in set(only)]
-    if not picked:
-        sys.exit("none of the selected URLs are in the list")
-    return picked
+def subset(args) -> list:
+    """The URLs this run was explicitly told to work on, or [] for "the whole list".
+
+    An explicit selection REPLACES the list, it does not filter it. The tracker holds
+    URLs that are not an active line in urls.txt - ones held back with a '#', and the
+    embed URLs a scan found on a page - and picking one of those has to work. Treating
+    --only as a filter made every one of them fail with "not in the list".
+    """
+    return list(dict.fromkeys(getattr(args, "only", None) or []))
 
 
 def read_urls(path: str) -> list[str]:
@@ -1299,7 +1305,7 @@ def write_hosts(diags: list, out: Path) -> None:
 
 
 async def run(args) -> int:
-    urls = subset(read_urls(args.urls), args)
+    urls = subset(args) or read_urls(args.urls)
 
     bad = [u for u in urls if not urlsplit(u).hostname]
     if bad:
