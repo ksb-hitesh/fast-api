@@ -1220,34 +1220,46 @@ async def run_evidence(args) -> int:
     return 0
 
 
-async def enrich_origins(results: list, out: Path, use_ytdlp: bool = False) -> None:
-    """For CDN-masked hosts, find the real delivery host and add its abuse desk.
+async def enrich_origins(results: list, out: Path, use_ytdlp: bool = False) -> list:
+    """Find the file host behind each page and give it a notice of its own.
 
-    Fetches player pages (needs the tunnel, unless --evidence cached them), reads the
-    stream URL, resolves the delivery host and appends a real hosting Contact. Also
-    collects crt.sh candidate origins into HOSTS.md - surfaced, never auto-mailed.
-    With use_ytdlp, yt-dlp reads gated/anti-bot players the regex path cannot.
+    The pages are shells; the video lives on a file host they embed, and several
+    pages usually share one file. That host is the highest-leverage target - killing
+    one file kills every page carrying it - and it is a different company from the
+    site, so it needs its own notice.
+
+    Returns `results` with one extra row per discovered embed: (embed URL, its abuse
+    desk). The embed URL, not the page URL - a file host cannot remove a page on
+    someone else's site, and a notice citing one it does not control gets binned.
+
+    Reads the saved --evidence copy when there is one, so after step 1 this costs no
+    fetch at all. With use_ytdlp, yt-dlp reads gated/anti-bot players the regex path
+    cannot. Also collects crt.sh candidate origins into HOSTS.md - surfaced, never
+    auto-mailed.
     """
     import origin  # lazy: origin imports from takedown, so this avoids an import cycle
 
-    diags = []
+    diags, found = [], {}
     async with httpx.AsyncClient(timeout=25, follow_redirects=True,
                                  headers={"User-Agent": UA}) as client:
-        for url, contacts in results:
-            if not any(c.kind == "hosting" and c.type == "form" for c in contacts):
-                continue  # only masked hosts pay for the extra fetch
-            diag, extra = await origin.origin_contacts(client, url, out, use_ytdlp)
+        for url, contacts in list(results):
+            diag, _ = await origin.origin_contacts(client, url, out, use_ytdlp)
             for h in diag["masked"]:
                 diag.setdefault("candidates", {})[h] = \
                     await origin.crt_candidates(client, origin._domain_of(h))
             diags.append(diag)
-            seen = {c.address.lower() for c in contacts}
-            for c in extra:
-                if c.address.lower() not in seen:
-                    contacts.append(c)
-                    seen.add(c.address.lower())
+            for entry in diag["delivery"]:
+                for u in entry["urls"]:
+                    if entry["contacts"]:
+                        found.setdefault(u, list(entry["contacts"]))
+
+    known = {u for u, _ in results}
+    extra = [(u, cs) for u, cs in found.items() if u not in known]
+    for u, cs in extra:
+        print(f"  embed: {u} -> {', '.join(c.address for c in cs)}", file=sys.stderr)
     if diags:
         write_hosts(diags, out)
+    return results + extra
 
 
 def write_hosts(diags: list, out: Path) -> None:
@@ -1310,8 +1322,8 @@ async def run(args) -> int:
     results = [(u, list(per_host[urlsplit(u).hostname][1])) for u in urls]
 
     out = Path(args.out)
-    if getattr(args, "origin", False):
-        await enrich_origins(results, out, getattr(args, "use_ytdlp", False))
+    if getattr(args, "origin", True):
+        results = await enrich_origins(results, out, getattr(args, "use_ytdlp", False))
 
     # After enrichment, before grouping: the notices are written from `groups`, not
     # from STATUS.csv, so an override that lands any later would never reach a draft.
@@ -1374,12 +1386,14 @@ def main() -> int:
                    help="also push each URL to the Wayback Machine. OFF by default: it "
                         "creates a PUBLIC permanent copy of the material. The private "
                         "freetsa.org timestamp proves the same thing without publishing.")
-    p.add_argument("--origin", action="store_true",
-                   help="for file-hosts hidden behind a CDN, fetch the player page, read "
-                        "the real stream URL, and address the notice to the datacenter "
-                        "actually serving the video. NEEDS THE TUNNEL (it fetches pages, "
-                        "unless --evidence already cached them). Also writes out/HOSTS.md "
-                        "with candidate origins to confirm.")
+    p.add_argument("--origin", action=argparse.BooleanOptionalAction, default=True,
+                   help="on by default: read each page's player, find the file host it "
+                        "embeds (iframe or stream URL), and write that host its own "
+                        "notice citing the embed URL. Several pages usually share one "
+                        "file, so this is the highest-leverage target. Reads the saved "
+                        "--evidence copy when there is one, otherwise NEEDS THE TUNNEL. "
+                        "Also writes out/HOSTS.md with candidate origins to confirm. "
+                        "--no-origin skips it.")
     p.add_argument("--use-ytdlp", action="store_true",
                    help="with --origin, also use yt-dlp to read the stream URL out of "
                         "gated/anti-bot players (streamtape and the like). Needs yt-dlp "

@@ -144,6 +144,25 @@ function drawSteps() {
       card.append(l);
       l.querySelector('input').checked = !!CFG.archive;
     }
+    if (s.id === 'report') {
+      const l = el('label', 'check',
+        '<input type="checkbox" id="opt-origin"><span><b>Also notify the file host '
+        + 'behind each page</b><br><span class="muted sm">Reads each page\'s player, '
+        + 'finds the video it embeds (iframe or stream URL) and writes that host its '
+        + 'own notice citing the embed URL. Several pages usually share one file, so '
+        + 'this is the highest-leverage target — killing the file kills every page '
+        + 'carrying it. Uses the saved evidence copy when there is one; otherwise it '
+        + 'fetches the pages.</span></span>');
+      card.append(l);
+      l.querySelector('input').checked = CFG.origin !== false;
+      const y = el('label', 'check',
+        '<input type="checkbox" id="opt-ytdlp"><span><b>Try harder on gated players'
+        + '</b><br><span class="muted sm">Also asks yt-dlp, which reads anti-bot '
+        + 'players (streamtape and the like) the plain parser cannot. Slower, and a '
+        + 'no-op if yt-dlp is not installed.</span></span>');
+      card.append(y);
+      y.querySelector('input').checked = !!CFG.use_ytdlp;
+    }
     if (s.id === 'discover') {
       const l = el('label', 'check',
         '<input type="checkbox" id="opt-offline"><span><b>Offline only</b><br>'
@@ -457,6 +476,9 @@ async function reportRun(urls) {
   const final = [...new Set([...fresh, ...extra])];
   if (!final.length)
     return toast('Nothing reported — none were ticked to send again.');
+  // step 3's own options, wherever the run was started from
+  await saveCfg({ origin: $('#opt-origin') ? $('#opt-origin').checked : true,
+                  use_ytdlp: !!($('#opt-ytdlp') && $('#opt-ytdlp').checked) });
   start(stepBy('report'), { urls: final });
 }
 

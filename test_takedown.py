@@ -1,5 +1,6 @@
 """Offline checks for the two things that break silently. Run: python test_takedown.py"""
 
+import asyncio
 import csv
 import tempfile
 from argparse import Namespace
@@ -170,6 +171,39 @@ def test_discovery():
     assert "%22a+b%22" in md, "title must be quoted and url-encoded"
     assert "search manually" in md, "a page with no leads must say so, not vanish"
     print("discovery OK")
+
+
+def test_embed_gets_its_own_notice_citing_its_own_url():
+    """enrich_origins must add a row for the file host, not fold it into the page's.
+
+    A file host cannot remove a page on someone else's site. A notice to them listing
+    only the shell URL is unactionable, so the embed URL has to reach group_contacts
+    as a target in its own right."""
+    import takedown as T
+    page, embed = "https://shell.example/watch/1", "https://filehost.example/e/abc"
+    ovh = Contact("hosting", "OVH", "abuse@ovh.net", "email")
+    site = Contact("site", "Shell", "abuse@shell.example", "email")
+
+    async def fake_origin_contacts(client, url, out, use_ytdlp=False):
+        return ({"page": url, "page_host": "shell.example", "masked": [],
+                 "delivery": [{"host": "filehost.example", "ip": "203.0.113.1",
+                               "ptr": "", "provider": "OVH", "contacts": [ovh],
+                               "urls": [embed]}]}, [ovh])
+
+    import origin as O
+    real = O.origin_contacts
+    O.origin_contacts = fake_origin_contacts
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            got = asyncio.run(T.enrich_origins([(page, [site])], Path(d)))
+    finally:
+        O.origin_contacts = real
+
+    assert [u for u, _ in got] == [page, embed], got
+    groups = group_contacts(got)
+    assert groups["abuse@shell.example"]["urls"] == [page]
+    assert groups["abuse@ovh.net"]["urls"] == [embed], \
+        "the file host must be told about its own file, not the shell page"
 
 
 def test_read_urls_collapses_duplicates():

@@ -115,6 +115,56 @@ def test_origin_contacts():
     print("origin_contacts OK")
 
 
+IFRAME_PAGE = """<html><body>
+  <h1>video</h1>
+  <iframe src="https://flash-files.com/e/dUlmhEq13yHMpbwu" allowfullscreen></iframe>
+  <iframe src="https://www.google.com/recaptcha/anchor?k=x"></iframe>
+</body></html>"""
+
+
+def test_iframe_embed_is_found_and_attributed_to_its_own_host():
+    """A page that iframes the player carries no media URL of its own, so the regex
+    path sees nothing and the file host - the highest-leverage target - is missed."""
+    takedown._dns_cache.clear()
+    takedown._dns_cache["flash-files.com"] = ("203.0.113.44", "")
+
+    async def _no_abusix(ip):
+        return []
+    orig_abusix = takedown.abusix_emails
+    takedown.abusix_emails = _no_abusix
+
+    rdap = {"name": "OVH", "entities": [
+        {"roles": ["abuse"], "vcardArray": ["vcard", [
+            ["version", {}, "text", "4.0"],
+            ["email", {}, "text", "abuse@ovh.net"]]]}]}
+
+    def handler(req):
+        u = str(req.url)
+        if "rdap.org" in u:
+            return httpx.Response(200, json=rdap)
+        if req.url.params.get("type") == "PTR":
+            return httpx.Response(200, json={"Status": 0, "Answer": []})
+        return httpx.Response(200, text=IFRAME_PAGE)
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            return await origin_contacts(c, "https://shell-site.example/watch/123")
+    try:
+        diag, contacts = _run(go())
+    finally:
+        takedown.abusix_emails = orig_abusix
+
+    assert stream_urls(IFRAME_PAGE, "https://shell-site.example/watch/123") == []
+    assert [c.address for c in contacts] == ["abuse@ovh.net"], contacts
+    entry = diag["delivery"][0]
+    assert entry["host"] == "flash-files.com", diag
+    # the URL a notice to that host has to cite - theirs, not the shell page's
+    assert entry["urls"] == ["https://flash-files.com/e/dUlmhEq13yHMpbwu"], entry
+    # recaptcha and friends must never become a takedown target
+    assert [e["host"] for e in diag["delivery"]] == ["flash-files.com"], diag
+    print("iframe embed OK")
+
+
 def test_falls_back_cleanly():
     """No stream URL, or a dead fetch, must yield no contact - the CDN form stays."""
     def empty(req):
@@ -207,6 +257,7 @@ if __name__ == "__main__":
     test_unpack()
     test_stream_urls()
     test_origin_contacts()
+    test_iframe_embed_is_found_and_attributed_to_its_own_host()
     test_falls_back_cleanly()
     test_ytdlp_merge()
     test_crt_candidates()

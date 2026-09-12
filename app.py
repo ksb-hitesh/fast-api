@@ -67,7 +67,7 @@ _md = MarkdownIt("commonmark", {"html": False, "linkify": True}).enable("table")
 DEFAULT_CONFIG = {
     "name": "", "email": "", "send_from": "", "postal": "",
     "india": True, "eu": False, "self_recorded": False, "archive": False,
-    "origin": False, "use_ytdlp": False,
+    "origin": True, "use_ytdlp": False,
     "rounds": 2, "portal_ack": "", "sent": [],
 }
 

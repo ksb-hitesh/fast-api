@@ -207,10 +207,17 @@ async def origin_contacts(client: httpx.AsyncClient, page_url: str, out=None,
     diag["masked"] for a crt.sh pass, not turned into a contact. With use_ytdlp,
     also asks yt-dlp (which can read gated/anti-bot players the regex path cannot).
     """
+    import discover  # lazy: keeps this module importable on its own
+
     diag = {"page": page_url, "page_host": host_of(page_url),
             "delivery": [], "masked": []}
     text = await _fetch_player(client, page_url, out)
-    media = stream_urls(text, page_url) if text else []
+    # Two ways a page carries someone else's video, and they miss different things:
+    # stream_urls reads the .mp4/.m3u8 out of a player built on this page, while an
+    # <iframe> hands the whole player to the file host and leaves no media URL here
+    # at all. A page that only iframes would otherwise look like it embeds nothing.
+    media = (stream_urls(text, page_url) +
+             sorted(discover.embeds(text, page_url))) if text else []
     if use_ytdlp:
         media += await asyncio.to_thread(ytdlp_stream_urls, page_url)
     if not media:
@@ -221,7 +228,9 @@ async def origin_contacts(client: httpx.AsyncClient, page_url: str, out=None,
     contacts: list[Contact] = []
     for h in hosts:
         ip, _ = await resolve(client, h)
-        entry = {"host": h, "ip": ip, "ptr": "", "provider": "", "contacts": []}
+        entry = {"host": h, "ip": ip, "ptr": "", "provider": "", "contacts": [],
+                 # the URLs on THIS host - what a notice to it has to cite
+                 "urls": [u for u in dict.fromkeys(media) if host_of(u) == h]}
         diag["delivery"].append(entry)
         if not ip:
             continue
