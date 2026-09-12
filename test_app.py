@@ -206,6 +206,31 @@ def test_mongo_roundtrip_preserves_evidence_bytes():
     storage.ROOT, storage._coll = real_root, real_coll
 
 
+def test_sample_files_match_the_code():
+    """A sample that has drifted from DEFAULT_CONFIG is worse than no sample."""
+    import json
+    sample = json.loads(Path("config.json.example").read_text())
+    assert set(sample) == set(app.DEFAULT_CONFIG), (
+        set(app.DEFAULT_CONFIG) ^ set(sample))
+    for k, v in app.DEFAULT_CONFIG.items():
+        assert type(sample[k]) is type(v), f"{k}: {type(sample[k])} vs {type(v)}"
+    # it must actually be loadable as config
+    assert app.build_ns(sample).name == "Your Full Name"
+
+    env = Path(".env.example").read_text()
+    for key in ("APP_PASSWORD", "SESSION_SECRET", "MONGODB_URI", "MONGODB_DB", "PORT"):
+        assert f"\n{key}=" in env, f"{key} missing from .env.example"
+    # every env var the code actually reads must be documented
+    for key in ("APP_PASSWORD", "SESSION_SECRET", "MONGODB_URI", "MONGODB_DB"):
+        assert key in env
+
+
+def test_secrets_stay_out_of_the_image():
+    ignore = Path(".dockerignore").read_text().split()
+    for leak in ("cyber_secure.conf", "config.json", "urls.txt", ".env", "out/"):
+        assert leak in ignore, f"{leak} would be baked into the docker image"
+
+
 def test_login_required():
     from fastapi.testclient import TestClient
     with TestClient(app.app) as c:

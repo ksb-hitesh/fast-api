@@ -67,6 +67,7 @@ _md = MarkdownIt("commonmark", {"html": False, "linkify": True}).enable("table")
 DEFAULT_CONFIG = {
     "name": "", "email": "", "send_from": "", "postal": "",
     "india": True, "eu": False, "self_recorded": False, "archive": False,
+    "origin": False,
     "rounds": 2, "portal_ack": "", "sent": [],
 }
 
@@ -97,6 +98,7 @@ def build_ns(cfg: dict) -> SimpleNamespace:
         eu=bool(cfg.get("eu")),
         india=bool(cfg.get("india")),
         archive=bool(cfg.get("archive")),
+        origin=bool(cfg.get("origin")),
         rounds=int(cfg.get("rounds") or 2),
     )
 

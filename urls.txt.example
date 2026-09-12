@@ -1,0 +1,14 @@
+# One full URL per line, pointing at the page the video is on.
+# Lines starting with # are ignored. Copy this to urls.txt - that file is
+# gitignored and is never committed.
+#
+# Start with the pages you already know about. Step 2 (Find more copies) works
+# outward from these and finds the video-file hosts they embed, which is where
+# the real leverage is: 16 pages are often only 4 files, and removing one file
+# kills every page carrying it.
+
+https://example-site.com/some-video-page/
+https://another-site.net/watch?v=abcde
+
+# Added from candidates 2026-01-01 00:00 UTC
+# https://videohost.example/e/9icjohukpyce

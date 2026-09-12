@@ -1,0 +1,14 @@
+{
+  "name": "Your Full Name",
+  "email": "you@example.com",
+  "send_from": "",
+  "postal": "Flat 4B, 12 Example Road\nBengaluru 560001\nKarnataka, India",
+  "india": true,
+  "eu": false,
+  "self_recorded": false,
+  "archive": false,
+  "origin": false,
+  "rounds": 2,
+  "portal_ack": "30412500000000",
+  "sent": []
+}

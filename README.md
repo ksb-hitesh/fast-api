@@ -39,6 +39,9 @@ having to think about WireGuard.** That is the real reason to run it there.
    | `APP_PASSWORD` | how you log in. The app refuses to start without it |
    | `MONGODB_URI` | the Atlas string. Without it the instance is ephemeral and says so |
 
+   `SESSION_SECRET` is generated for you by `render.yaml`. See `.env.example` for
+   what each variable does and how to generate a good value.
+
 3. **Open the URL on your phone** and log in. Add it to your home screen.
 
 Free tier notes: the service sleeps after 15 minutes of no traffic and takes ~50s to
@@ -48,12 +51,36 @@ and a job keeps running server-side even if you lock your phone or close the tab
 ### Run it locally instead
 
 ```bash
-APP_PASSWORD=whatever python -m uvicorn app:app --reload
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirement.txt
+
+cp .env.example .env          # then edit it - at minimum set APP_PASSWORD
+uvicorn app:app --env-file .env --reload
 ```
 
-Without `MONGODB_URI` it just uses the local `out/` directory, exactly like the CLI.
-Locally you still need the tunnel (see Step 0) — that requirement only disappears when
-it runs outside India.
+Then open **http://127.0.0.1:8000** and log in with `APP_PASSWORD`.
+(`--port 8000` if you want a different one; `PORT` in `.env` is only read by the
+Dockerfile, not by `uvicorn` directly.)
+
+`.env.example` documents every variable with working sample values and the one-liners
+to generate real secrets. `.env` is gitignored. `--env-file` needs no extra install —
+`uvicorn[standard]` already bundles `python-dotenv`.
+
+Without `MONGODB_URI` it just uses the local `out/` directory, exactly like the CLI,
+and the header says *ephemeral* so you are never guessing. Locally you still need the
+tunnel (see Step 0) — that requirement only disappears when it runs outside India.
+
+### Sample files
+
+| Copy this | To | Holds |
+|---|---|---|
+| `.env.example` | `.env` | password, session secret, Mongo connection string |
+| `urls.txt.example` | `urls.txt` | the pages you are reporting |
+| `config.json.example` | `config.json` | your name, reply-to, postal address, legal grounds |
+
+All three targets are gitignored. You do not need to write `config.json` by hand — the
+web app's **Edit your details** form writes it for you, and the sample is there so you
+can see the shape or pre-seed it.
 
 ### What the web app adds
 

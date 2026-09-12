@@ -272,15 +272,28 @@ async def rdap(client: httpx.AsyncClient, path: str) -> dict:
     return {}
 
 
+def is_cdn(net: str) -> tuple[str, str] | None:
+    """(label, abuse-form URL) if this RDAP network name is a known CDN, else None.
+
+    Single source of the CDN list, so hosting_contacts and origin.crt_candidates
+    agree on what counts as "masked".
+    """
+    low = net.lower()
+    for needle, (label, form) in CDN_FORMS.items():
+        if needle in low:
+            return label, form
+    return None
+
+
 async def hosting_contacts(client: httpx.AsyncClient, ip: str) -> list[Contact]:
     data = await rdap(client, f"ip/{ip}")
     net = (data.get("name") or "") + " " + str(data.get("remarks") or "")
     provider = data.get("name") or f"network holding {ip}"
 
-    for needle, (label, form) in CDN_FORMS.items():
-        if needle in net.lower():
-            # Behind a CDN: the real host is masked, so report to the CDN's form.
-            return [Contact("hosting", f"{label} (CDN — origin host is masked)", form, "form")]
+    cdn = is_cdn(net)
+    if cdn:
+        # Behind a CDN: the real host is masked, so report to the CDN's form.
+        return [Contact("hosting", f"{cdn[0]} (CDN — origin host is masked)", cdn[1], "form")]
 
     addrs = dict.fromkeys(_abuse_emails(data) + await abusix_emails(ip))
     return [Contact("hosting", provider, a, "email") for a in addrs]
@@ -1141,6 +1154,71 @@ async def run_evidence(args) -> int:
     return 0
 
 
+async def enrich_origins(results: list, out: Path) -> None:
+    """For CDN-masked hosts, find the real delivery host and add its abuse desk.
+
+    Fetches player pages (needs the tunnel, unless --evidence cached them), reads the
+    stream URL, resolves the delivery host and appends a real hosting Contact. Also
+    collects crt.sh candidate origins into HOSTS.md - surfaced, never auto-mailed.
+    """
+    import origin  # lazy: origin imports from takedown, so this avoids an import cycle
+
+    diags = []
+    async with httpx.AsyncClient(timeout=25, follow_redirects=True,
+                                 headers={"User-Agent": UA}) as client:
+        for url, contacts in results:
+            if not any(c.kind == "hosting" and c.type == "form" for c in contacts):
+                continue  # only masked hosts pay for the extra fetch
+            diag, extra = await origin.origin_contacts(client, url, out)
+            for h in diag["masked"]:
+                diag.setdefault("candidates", {})[h] = \
+                    await origin.crt_candidates(client, origin._domain_of(h))
+            diags.append(diag)
+            seen = {c.address.lower() for c in contacts}
+            for c in extra:
+                if c.address.lower() not in seen:
+                    contacts.append(c)
+                    seen.add(c.address.lower())
+    if diags:
+        write_hosts(diags, out)
+
+
+def write_hosts(diags: list, out: Path) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    lines = ["# Real delivery hosts and candidate origins\n",
+             "\nWho actually serves each video, found by reading the stream URL out of "
+             "the player. The delivery-host abuse desks below are already in your .eml "
+             "drafts. The CANDIDATE ORIGINS are unverified leads - confirm before using.\n",
+             "\n## Real delivery hosts\n"]
+    for d in diags:
+        lines.append(f"\n### {d['page']}\n")
+        if not d["delivery"]:
+            lines.append("\n(no stream URL could be read from the player)\n")
+        for e in d["delivery"]:
+            ptr = f" [{e['ptr']}]" if e["ptr"] else ""
+            lines.append(f"\n- **{e['host']}** -> {e['ip'] or 'unresolved'}{ptr}"
+                         f" — {e['provider'] or 'unknown network'}\n")
+            for c in e["contacts"]:
+                lines.append(f"    - abuse: {c.address}\n")
+            if not e["contacts"] and e["host"] in d["masked"]:
+                lines.append("    - still behind a CDN — see candidate origins below\n")
+
+    cand = [(h, cs) for d in diags for h, cs in (d.get("candidates") or {}).items()]
+    if cand:
+        lines.append("\n## CANDIDATE ORIGINS (crt.sh — UNVERIFIED, confirm before using)\n")
+        lines.append("\nEach IP holds a TLS certificate for a subdomain of the file host "
+                     "and is NOT on a CDN, so one of them may be the origin. A cert match "
+                     "is not proof: verify the IP actually serves the video before sending "
+                     "a notice — a wrong host costs you credibility with the desks that act.\n")
+        for h, cs in cand:
+            lines.append(f"\n### {h}\n")
+            if not cs:
+                lines.append("\n(no non-CDN certificate hosts found)\n")
+            for name, ip, prov in cs:
+                lines.append(f"- {name} -> {ip}  ({prov or 'unknown network'})\n")
+    (out / "HOSTS.md").write_text("".join(lines))
+
+
 async def run(args) -> int:
     urls = read_urls(args.urls)
 
@@ -1160,10 +1238,15 @@ async def run(args) -> int:
         per_host = dict(await asyncio.gather(*(one(h) for h in hosts)))
 
     ips = {h: ip for h, (ip, _) in per_host.items()}
-    results = [(u, per_host[urlsplit(u).hostname][1]) for u in urls]
+    # Own list per URL: origin enrichment appends to it without touching the shared
+    # per-host list (many URLs can share one host).
+    results = [(u, list(per_host[urlsplit(u).hostname][1])) for u in urls]
+
+    out = Path(args.out)
+    if getattr(args, "origin", False):
+        await enrich_origins(results, out)
 
     groups = group_contacts(results)
-    out = Path(args.out)
     write_outputs(args, results, groups, ips, out)
 
     sent = datetime.now(timezone.utc)
@@ -1220,6 +1303,12 @@ def main() -> int:
                    help="also push each URL to the Wayback Machine. OFF by default: it "
                         "creates a PUBLIC permanent copy of the material. The private "
                         "freetsa.org timestamp proves the same thing without publishing.")
+    p.add_argument("--origin", action="store_true",
+                   help="for file-hosts hidden behind a CDN, fetch the player page, read "
+                        "the real stream URL, and address the notice to the datacenter "
+                        "actually serving the video. NEEDS THE TUNNEL (it fetches pages, "
+                        "unless --evidence already cached them). Also writes out/HOSTS.md "
+                        "with candidate origins to confirm.")
     p.add_argument("--check", action="store_true",
                    help="re-fetch every URL in STATUS.csv and record whether it is "
                         "actually gone. Safe to re-run as often as you like.")
