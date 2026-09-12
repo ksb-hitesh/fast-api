@@ -48,13 +48,16 @@
 <section id="p-urls" class="panel" hidden>
   <div class="card">
     <div class="row"><h2>URL list</h2><span id="urls-count" class="muted sm"></span></div>
-    <p class="muted sm">Everything the tool works on. Untick <b>In report</b> to hold a
-      URL back from the next run without losing it. This never leaves your instance or
-      gets committed.</p>
+    <p class="muted sm">Everything the tool works on. Tick rows and
+      <b>Generate notices</b> looks those up again from scratch and rewrites their
+      notices — a URL you reported before is not skipped. Untick <b>In report</b> to
+      hold a URL back from the next run without losing it. This never leaves your
+      instance or gets committed.</p>
     <div class="row">
       <button onclick="addurls.showModal()">+ Add URLs</button>
       <button class="ghost sm sel" onclick="recheckSel()" disabled>↻ Recheck</button>
-      <button class="ghost sm sel" onclick="reportSel()" disabled>📤 Generate notices</button>
+      <button class="ghost sm sel" onclick="reportSel()" disabled
+              title="Look the selected URLs up again — hosts, registrars and the file host they embed — and write fresh notices. Already reported is not a reason to skip.">📤 Generate notices</button>
       <button class="ghost sm sel" onclick="includeSel(true)" disabled>✓ In report</button>
       <button class="ghost sm sel" onclick="includeSel(false)" disabled>✗ Out</button>
       <button class="ghost sm sel" onclick="openContacts(picked())" disabled>✉ Contact</button>

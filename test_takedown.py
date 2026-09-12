@@ -173,6 +173,46 @@ def test_discovery():
     print("discovery OK")
 
 
+def test_reporting_a_selection_again_rescans_instead_of_trusting_the_old_row():
+    """Picking a URL and reporting it must redo the lookups and rewrite the draft.
+
+    STATUS.csv already holds a contacts column from the last pass; reading that back
+    instead of looking the host up again would keep mailing a desk that has since
+    changed, and would never pick up a file host added by a later scan."""
+    import takedown as T
+    u = "https://s.com/a"
+    looked_up = []
+
+    async def fake_lookup(client, host):
+        looked_up.append(host)
+        return "203.0.113.5", [Contact("hosting", "New Host", "abuse@new.net", "email")]
+
+    with tempfile.TemporaryDirectory() as d:
+        out = Path(d)
+        urls = out / "urls.txt"
+        urls.write_text(u + "\n")
+        stale = "2020-01-01T00:00:00+00:00"
+        update_status(out, {u: {"reported_utc": stale, "deadline_utc": stale,
+                                "contacts": "abuse@stale.net"}})
+        args = Namespace(urls=str(urls), out=str(d), only=[u], name="A Person",
+                         email="a@b.com", send_from=None, postal="",
+                         self_recorded=False, eu=False, india=True,
+                         origin=False, use_ytdlp=False)
+        real, T.lookup_host = T.lookup_host, fake_lookup
+        try:
+            assert asyncio.run(T.run(args)) == 0
+        finally:
+            T.lookup_host = real
+
+        assert looked_up == ["s.com"], "the host must be resolved again, not reused"
+        row = load_status(out)[u]
+        assert row["reported_utc"] != stale, "an old report date must not block a new one"
+        assert row["deadline_utc"] != stale, "the deadline has to restart"
+        assert row["contacts"] == "abuse@new.net", row["contacts"]
+        drafts = sorted(p.name for p in out.glob("*.eml"))
+        assert any("abuse-new.net" in n for n in drafts), drafts
+
+
 def test_embed_gets_its_own_notice_citing_its_own_url():
     """enrich_origins must add a row for the file host, not fold it into the page's.
 

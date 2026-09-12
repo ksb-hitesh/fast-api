@@ -443,19 +443,26 @@ async function saveContacts() {
 
 const stepBy = id => STEPS.find(s => s.id === id);
 const recheckSel = () => start(stepBy('check'), { urls: picked() });
-const reportSel = () => reportRun(picked());
+// Ticking rows and pressing the button IS the decision. Re-scan exactly those and
+// write the notices, whatever they were reported as before.
+const reportSel = () => reportRun(picked(), true);
 
-/* Nothing is silently re-reported. A URL that already went out is listed and left
-   unticked: re-reporting restarts its deadline, which is rarely what you want —
-   chasing a desk that ignored you is what "Follow up" is for. */
-async function reportRun(urls) {
+/* Only the "run everything" button asks. There the URLs were never chosen one by
+   one, so re-reporting the whole list is usually a slip: it restarts every deadline,
+   and chasing a desk that ignored you is what "Follow up" is for. */
+async function reportRun(urls, forced) {
   if (S.needs_identity) return openIdentity();
   if (!urls.length) return toast('Nothing selected.');
   const by = Object.fromEntries(S.table.map(r => [r.url, r]));
   const fresh = urls.filter(u => !(by[u] && by[u].reported));
   const again = urls.filter(u => by[u] && by[u].reported);
   let extra = [];
-  if (again.length) {
+  if (forced) {
+    extra = again;
+    toast(again.length
+      ? `Re-scanning ${urls.length} URL(s) — ${again.length} get a fresh deadline.`
+      : `Scanning ${urls.length} URL(s).`);
+  } else if (again.length) {
     const ok = await ask(`${again.length} already reported`,
       (fresh.length
         ? `<p><b>${fresh.length} new URL(s)</b> will be reported. The rest went out `
