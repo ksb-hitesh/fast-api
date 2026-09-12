@@ -533,7 +533,7 @@ async def run_preflight(args) -> int:
 
 STATUS_FIELDS = ["url", "hostname", "first_seen_utc", "evidence_utc", "page_sha256",
                  "timestamp", "wayback", "reported_utc", "deadline_utc", "contacts",
-                 "followup_utc",
+                 "manual_contacts", "followup_utc",
                  "last_checked_utc", "http_status", "check_note", "removed_utc"]
 
 # Phrases sites put up in place of a removed video. Deliberately conservative:
@@ -606,9 +606,12 @@ def state_of(row: dict, now: datetime) -> str:
     """Derived, never stored - so it can't go stale against the facts."""
     if row.get("removed_utc"):
         return "REMOVED"
-    if row.get("check_note") == "blocked":
+    # startswith, not ==: a note may carry who said so ("unclear (checked by hand)")
+    # and the state must not quietly fall through to something milder.
+    note = row.get("check_note") or ""
+    if note.startswith("blocked"):
         return "BLOCKED"
-    if row.get("check_note") == "unclear":
+    if note.startswith("unclear"):
         return "UNCLEAR"
     if row.get("followup_utc"):
         return "CHASED"
@@ -988,6 +991,26 @@ def overdue_rows(out: Path, hours: float) -> dict[str, dict]:
     return groups
 
 
+def apply_manual_contacts(results: list, rows: dict) -> list:
+    """A hand-entered abuse address wins over whatever the lookups found.
+
+    RDAP gives you the registrar and the network owner. Neither is reliably the desk
+    that actually acts - a host's published abuse@ can bounce while a support address
+    on their site answers in an hour. Only the person who got a reply knows that, so
+    they get to say so, and what they say replaces the guess for that URL.
+    """
+    merged = []
+    for url, contacts in results:
+        manual = (rows.get(url) or {}).get("manual_contacts", "")
+        picked = [a.strip() for a in manual.split(";") if a.strip()]
+        if picked:
+            contacts = [Contact("hosting", "entered by hand", a,
+                                "form" if a.startswith("http") else "email")
+                        for a in dict.fromkeys(picked)]
+        merged.append((url, contacts))
+    return merged
+
+
 def write_followup(args, groups: dict, out: Path, hours: float) -> None:
     env = jinja_env()
     fu = out / "followup"
@@ -1289,6 +1312,10 @@ async def run(args) -> int:
     out = Path(args.out)
     if getattr(args, "origin", False):
         await enrich_origins(results, out, getattr(args, "use_ytdlp", False))
+
+    # After enrichment, before grouping: the notices are written from `groups`, not
+    # from STATUS.csv, so an override that lands any later would never reach a draft.
+    results = apply_manual_contacts(results, load_status(out))
 
     groups = group_contacts(results)
     write_outputs(args, results, groups, ips, out)

@@ -57,6 +57,15 @@
       <button class="ghost sm sel" onclick="reportSel()" disabled>📤 Generate notices</button>
       <button class="ghost sm sel" onclick="includeSel(true)" disabled>✓ In report</button>
       <button class="ghost sm sel" onclick="includeSel(false)" disabled>✗ Out</button>
+      <button class="ghost sm sel" onclick="openContacts(picked())" disabled>✉ Contact</button>
+      <select id="mark" class="sel inline" onchange="markSel(this)" disabled
+              aria-label="Record what you found by hand">
+        <option value="">Mark as…</option>
+        <option value="removed">✓ Gone — I checked</option>
+        <option value="up">● Still up — I checked</option>
+        <option value="unclear">? Could not tell</option>
+        <option value="reported">📤 Reported by hand</option>
+      </select>
       <button class="ghost sm sel danger" onclick="removeSel()" disabled>🗑 Remove</button>
     </div>
     <div id="urls-table"></div>
@@ -183,6 +192,30 @@
     <div class="row">
       <button onclick="addUrls()">Add</button>
       <button class="ghost" onclick="addurls.close()">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="contactdlg">
+  <form method="dialog" onsubmit="return false">
+    <h2>Abuse contact</h2>
+    <p class="muted sm" id="contact-for"></p>
+    <p class="muted sm">One address per line — an email, or a web-form URL. This
+      <b>replaces</b> what the lookups found, so the next <b>Generate notices</b>
+      writes the draft to exactly these. Every URL pointing at the same address is
+      batched into one notice.</p>
+    <textarea id="contact-text" rows="4" spellcheck="false"
+              placeholder="abuse@realhost.com"></textarea>
+    <label class="check" id="contact-also-wrap" hidden>
+      <input type="checkbox" id="contact-also" checked>
+      <span>Apply to the <b id="contact-also-n">0</b> other URL(s) pointing at the
+        same address<br><span class="muted sm">They are already batched into one
+        notice, so they need the same correction.</span></span></label>
+    <p class="muted sm" id="contact-found"></p>
+    <p id="contact-err" class="err sm" hidden></p>
+    <div class="row">
+      <button onclick="saveContacts()">Save</button>
+      <button class="ghost" onclick="contactdlg.close()">Cancel</button>
     </div>
   </form>
 </dialog>

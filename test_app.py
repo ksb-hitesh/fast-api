@@ -80,7 +80,10 @@ def test_dns_cache_cleared_each_job():
     assert "stale.example" not in takedown._dns_cache
 
 
-def test_mailto_truncates_long_notices_and_flags_it():
+def test_mailto_carries_the_address_and_subject_but_never_the_body():
+    """A notice is far longer than any mail app's URL limit. A body in the mailto:
+    came back silently cut off mid-sentence, which looks complete and is not - so
+    the draft opens empty and the body is pasted from the Copy button instead."""
     with tempfile.TemporaryDirectory() as d:
         p = Path(d) / "01-abuse-x.com.eml"
         from email.message import EmailMessage
@@ -88,26 +91,19 @@ def test_mailto_truncates_long_notices_and_flags_it():
         m["Subject"] = "URGENT - NCII takedown"
         m["To"] = "abuse@x.com"
         m["From"] = "me@example.com"
-        body = "https://site.com/a\n" + ("word " * 2000)
-        m.set_content(body)
+        m.set_content("https://site.com/a\n" + ("word " * 2000))
         p.write_bytes(m.as_bytes())
 
         got = app._parse_eml(p, "notice")
         assert got["to"] == "abuse@x.com"
         assert got["body"].startswith("https://site.com/a")   # quoted-printable decoded
         assert got["urls"] == ["https://site.com/a"]
-        assert got["too_long"] is True
-        assert "truncated" in got["mailto"]
-        assert len(got["mailto"]) < len(body) * 3
-
-        short = EmailMessage()
-        short["Subject"] = "s"
-        short["To"] = "a@b.com"
-        short.set_content("https://x.com/1\nshort body")
-        p.write_bytes(short.as_bytes())
-        got = app._parse_eml(p, "notice")
-        assert got["too_long"] is False
+        assert got["mailto"] == ("mailto:abuse%40x.com"
+                                 "?subject=URGENT%20-%20NCII%20takedown")
+        assert "body=" not in got["mailto"]
         assert "truncated" not in got["mailto"]
+        # the full text is still handed to the UI, for Copy and for reading
+        assert got["body"].count("word") == 2000
 
 
 def test_artifact_path_cannot_escape_out():
@@ -246,6 +242,75 @@ def test_run_passes_the_selection_through_as_only():
         finally:
             app._dispatch = real
     assert seen["only"] == [B], seen
+
+
+def test_manual_verdicts_write_the_same_fields_the_check_would():
+    now = datetime.now(timezone.utc)
+    with sandbox(f"{A}\n{B}\n") as c:
+        takedown.update_status(app.OUT, {A: {"evidence_utc": "e"}, B: {"evidence_utc": "e"}})
+
+        assert c.post("/api/urls/status",
+                      json={"urls": [A, B], "verdict": "removed"}).status_code == 200
+        rows = takedown.load_status(app.OUT)
+        assert takedown.state_of(rows[A], now) == "REMOVED"
+        assert rows[A]["removed_utc"] and rows[A]["last_checked_utc"]
+
+        # a wrong call must be reversible: removed_utc has to actually blank out
+        c.post("/api/urls/status", json={"urls": [A], "verdict": "up"})
+        rows = takedown.load_status(app.OUT)
+        assert rows[A]["removed_utc"] == ""
+        assert takedown.state_of(rows[A], now) == "EVIDENCE"
+        assert takedown.state_of(rows[B], now) == "REMOVED", "only the named URLs change"
+
+        c.post("/api/urls/status", json={"urls": [A], "verdict": "unclear"})
+        assert takedown.state_of(takedown.load_status(app.OUT)[A], now) == "UNCLEAR"
+
+        c.post("/api/urls/status", json={"urls": [A], "verdict": "reported"})
+        rows = takedown.load_status(app.OUT)
+        assert rows[A]["reported_utc"] and rows[A]["deadline_utc"]
+
+        assert c.post("/api/urls/status",
+                      json={"urls": [A], "verdict": "nonsense"}).status_code == 400
+
+
+def test_contact_override_is_validated_and_reaches_the_draft():
+    """The notices are built from live lookups, not from STATUS.csv - an override
+    that only landed in the CSV would show in the UI and change no draft at all."""
+    with sandbox(f"{A}\n") as c:
+        r = c.post("/api/urls/contacts", json={"urls": [A], "contacts": "not an address"})
+        assert r.status_code == 400, r.json()
+
+        r = c.post("/api/urls/contacts",
+                   json={"urls": [A],
+                         "contacts": "abuse@real.com\nhttps://form.example/report"})
+        assert r.status_code == 200, r.json()
+        assert takedown.load_status(app.OUT)[A]["manual_contacts"] == \
+            "abuse@real.com; https://form.example/report"
+
+        found = [(A, [takedown.Contact("registrar", "Wrong Registrar",
+                                       "abuse@wrong.com", "email")])]
+        merged = takedown.apply_manual_contacts(found, takedown.load_status(app.OUT))
+        addrs = [x.address for x in merged[0][1]]
+        assert addrs == ["abuse@real.com", "https://form.example/report"], addrs
+        groups = takedown.group_contacts(merged)
+        assert "abuse@wrong.com" not in groups, "the override must replace the guess"
+        assert groups["https://form.example/report"]["type"] == "form"
+
+        # the point of overriding a batch: same address -> still one notice, not N
+        c.post("/api/urls/contacts",
+               json={"urls": [A, B], "contacts": "abuse@real.com"})
+        two = takedown.apply_manual_contacts(
+            [(A, []), (B, [takedown.Contact("site", "S", "abuse@b.com", "email")])],
+            takedown.load_status(app.OUT))
+        g = takedown.group_contacts(two)
+        assert list(g) == ["abuse@real.com"], g
+        assert g["abuse@real.com"]["urls"] == [A, B]
+
+        # clearing falls back to the lookups
+        c.post("/api/urls/contacts", json={"urls": [A, B], "contacts": ""})
+        assert takedown.load_status(app.OUT)[A]["manual_contacts"] == ""
+        back = takedown.apply_manual_contacts(found, takedown.load_status(app.OUT))
+        assert [x.address for x in back[0][1]] == ["abuse@wrong.com"]
 
 
 def test_deleting_a_notice_puts_its_urls_back_to_unreported():

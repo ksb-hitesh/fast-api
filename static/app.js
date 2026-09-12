@@ -277,14 +277,17 @@ function drawUrls() {
   }
   t.innerHTML = '<div class="scroll"><table><thead><tr><th><input type="checkbox" '
     + 'id="url-all" aria-label="Select all"></th><th>URL</th><th>Status</th>'
-    + '<th>Reported</th><th>Last check</th><th>In report</th></tr></thead><tbody>'
+    + '<th>Reported</th><th>Last check</th><th>Abuse contact</th><th>In report</th>'
+    + '</tr></thead><tbody>'
     + rows.map(r => {
       // null means STATUS.csv still tracks it but the line is gone from urls.txt.
       const orphan = r.in_list === null || r.in_list === undefined;
       const out = r.in_list === false;
       return `<tr${out || orphan ? ' style="opacity:.55"' : ''}>`
         + `<td><input type="checkbox" value="${esc(r.url)}"></td>`
-        + `<td class="brk">${esc(r.url)}`
+        // noreferrer as well as noopener: the site must not learn this app's address.
+        + `<td class="brk"><a href="${esc(r.url)}" target="_blank" rel="noopener `
+        + `noreferrer" title="Open in a new tab and check it yourself">${esc(r.url)}</a>`
         + (orphan ? '<br><span class="muted sm">tracked, no longer in the list</span>' : '')
         + `</td><td><i class="dotc s-${esc(r.state)}"></i> ${esc(r.state)}`
         + (r.note ? `<br><span class="muted sm">${esc(r.note)}`
@@ -292,6 +295,7 @@ function drawUrls() {
         + `</td><td>${short(r.reported)}`
         + (r.deadline ? `<br><span class="muted sm">due ${short(r.deadline)}</span>` : '')
         + `</td><td>${short(r.checked)}</td>`
+        + `<td>${contactCell(r)}</td>`
         + `<td>${orphan ? '—' : out ? '✗' : '✓'}</td></tr>`;
     }).join('') + '</tbody></table></div>';
   $('#url-all').onchange = e => {
@@ -299,7 +303,21 @@ function drawUrls() {
     syncUrlBtns();
   };
   urlBoxes().forEach(b => b.onchange = syncUrlBtns);
+  t.querySelectorAll('button[data-contact]').forEach(b =>
+    b.onclick = () => openContacts([b.dataset.contact]));
   syncUrlBtns();
+}
+
+/* What the next notice will actually be addressed to. A hand-entered address wins,
+   and says so — the whole point is knowing which one is in force. */
+function contactCell(r) {
+  const own = r.manual_contacts;
+  const shown = own || r.contacts;
+  return (shown
+      ? `<span class="brk sm">${esc(shown.split('; ').join(', '))}</span>`
+        + (own ? ' <span class="tier t-CONFIRMED">by hand</span>' : '')
+      : '<span class="muted sm">not looked up yet</span>')
+    + `<br><button class="ghost sm" data-contact="${esc(r.url)}">✉ Edit</button>`;
 }
 
 async function urlEdit(payload, msg) {
@@ -339,6 +357,69 @@ async function removeSel() {
     'To stop working on a URL without deleting anything, use <b>Out</b> instead.</p>'))
     return;
   urlEdit({ op: 'remove', urls }, j => `Removed ${j.removed}.`);
+}
+
+async function markSel(sel) {
+  const verdict = sel.value, urls = picked();
+  sel.value = '';                                  // never sticks as a mode
+  if (!verdict || !urls.length) return;
+  const r = await fetch('/api/urls/status', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ urls, verdict }),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) return toast(j.detail || 'failed');
+  toast(`${j.changed} URL(s) updated.`);
+  refresh();
+}
+
+let contactUrls = [], contactAlso = [];
+const effContact = r => r.manual_contacts || r.contacts || '';
+
+function openContacts(urls) {
+  if (!urls.length) return toast('Nothing selected.');
+  contactUrls = urls;
+  const rows = urls.map(u => S.table.find(x => x.url === u)).filter(Boolean);
+  const vals = [...new Set(rows.map(effContact))];
+  const one = rows.length === 1 ? rows[0] : null;
+
+  // group_contacts() batches by address, so URLs already sharing this desk are in
+  // the same notice. Correcting one and leaving the rest splits that mail in two.
+  contactAlso = one && effContact(one)
+    ? S.table.filter(r => r.url !== one.url && effContact(r) === effContact(one))
+        .map(r => r.url)
+    : [];
+
+  $('#contact-for').textContent = one ? one.url : `${rows.length} URLs selected`;
+  $('#contact-text').value = vals.length === 1
+    ? vals[0].split('; ').filter(Boolean).join('\n') : '';
+  $('#contact-found').textContent =
+    vals.length > 1 ? `These ${rows.length} URLs do not share one address — saving `
+                      + 'sets every one of them to what you type.'
+    : one && one.contacts ? `Lookups found: ${one.contacts}`
+    : 'Lookups have not run for these yet.';
+  $('#contact-also-wrap').hidden = !contactAlso.length;
+  $('#contact-also').checked = true;
+  $('#contact-also-n').textContent = contactAlso.length;
+  $('#contact-err').hidden = true;
+  contactdlg.showModal();
+}
+
+async function saveContacts() {
+  const urls = contactUrls.concat(
+    contactAlso.length && $('#contact-also').checked ? contactAlso : []);
+  const r = await fetch('/api/urls/contacts', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ urls, contacts: $('#contact-text').value }),
+  });
+  const j = await r.json().catch(() => ({}));
+  $('#contact-err').textContent = j.detail || '';
+  $('#contact-err').hidden = r.ok;
+  if (!r.ok) return;
+  contactdlg.close();
+  toast(j.contacts ? `Saved — ${j.changed} URL(s) now go to this address, as one notice.`
+                   : 'Cleared — back to whatever the lookups find.');
+  refresh();
 }
 
 const stepBy = id => STEPS.find(s => s.id === id);
@@ -466,15 +547,14 @@ function noticeCard(i) {
   det.append(el('pre', 'log', esc(i.body)));
   card.append(det);
 
-  if (i.too_long) card.append(el('p', 'sm',
-    '<span class="err">Too long for a mailto: link.</span> ' +
-    '<span class="muted">Your mail app would silently cut it off — open the mail app, ' +
-    'then tap <b>Copy full notice</b> and paste over the body.</span>'));
+  card.append(el('p', 'muted sm',
+    '<b>1.</b> Copy the notice · <b>2.</b> open the mail — it comes addressed and '
+    + 'titled, with an empty body · <b>3.</b> paste, read it once more, send.'));
 
   const row = el('div', 'row');
-  const mail = el('a', 'btn', '📧 Open in mail');
+  row.append(mk('📋 Copy notice', () => copy(i.body)));
+  const mail = el('a', 'btn ghost', '📧 Open in mail');
   mail.href = i.mailto; row.append(mail);
-  row.append(mk('📋 Copy full notice', () => copy(i.body), 'ghost'));
   const dl = el('a', 'btn ghost sm', '⬇ .eml');
   dl.href = '/artifact/' + (i.kind === 'notice' ? '' : 'followup/') + i.file + '?raw=1';
   row.append(dl);

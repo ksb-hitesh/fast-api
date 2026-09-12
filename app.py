@@ -24,7 +24,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import quote, urlsplit
@@ -425,6 +425,7 @@ async def api_state(request: Request):
             "http_status": r.get("http_status", ""),
             "note": r.get("check_note", ""),
             "contacts": r.get("contacts", ""),
+            "manual_contacts": r.get("manual_contacts", ""),
             "first_seen": r.get("first_seen_utc", ""),
             "evidence": bool(r.get("evidence_utc")),
             # True = in the list, False = commented out, null = tracked but the line
@@ -634,6 +635,76 @@ async def api_urls_edit(request: Request):
     return {"ok": True, "count": _url_count(), **result}
 
 
+# What a human verdict writes. state_of() stays derived from the facts, so a manual
+# call sets the same fields --check would have set, never a second "status" column
+# that could drift away from them.
+VERDICTS = {
+    "removed":  {"removed_utc": "now", "check_note": "removed (checked by hand)"},
+    "up":       {"removed_utc": "",    "check_note": "still up (checked by hand)"},
+    "unclear":  {"removed_utc": "",    "check_note": "unclear (checked by hand)"},
+    "reported": {"reported_utc": "now", "deadline_utc": "deadline"},
+}
+
+
+@app.post("/api/urls/status")
+async def api_urls_status(request: Request):
+    """Record what you found yourself, for URLs the automated check cannot call."""
+    require_login(request)
+    body = await request.json()
+    verdict = body.get("verdict")
+    urls = [u for u in (body.get("urls") or []) if u.startswith("http")]
+    if verdict not in VERDICTS:
+        raise HTTPException(400, f"verdict must be one of {', '.join(VERDICTS)}")
+    if not urls:
+        raise HTTPException(400, "nothing selected")
+
+    cfg = load_config()
+    now = datetime.now(timezone.utc)
+    due = now + timedelta(hours=2 if cfg.get("india") else 48)
+    stamp = now.isoformat(timespec="seconds")
+    fields = {k: stamp if v == "now" else due.isoformat(timespec="seconds")
+              if v == "deadline" else v
+              for k, v in VERDICTS[verdict].items()}
+    if verdict != "reported":
+        fields["last_checked_utc"] = stamp
+
+    # update_status() cannot write a blank, so un-setting removed_utc needs the
+    # clearing path; everything non-empty goes through the normal merge.
+    blanks = [k for k, v in fields.items() if v == ""]
+    if blanks:
+        takedown.clear_status_fields(OUT, urls, blanks)
+    rows = takedown.update_status(
+        OUT, {u: {k: v for k, v in fields.items() if v} for u in urls})
+    takedown.write_status_table(OUT, rows)
+    await asyncio.to_thread(storage.push)
+    return {"ok": True, "changed": len(urls)}
+
+
+@app.post("/api/urls/contacts")
+async def api_urls_contacts(request: Request):
+    """Override the abuse address for a URL. Empty falls back to what lookups find."""
+    require_login(request)
+    body = await request.json()
+    urls = [u for u in (body.get("urls") or []) if u.startswith("http")]
+    if not urls:
+        raise HTTPException(400, "nothing selected")
+    picked = [a.strip() for a in re.split(r"[;,\s]+", body.get("contacts") or "")
+              if a.strip()]
+    bad = [a for a in picked if not (a.startswith("http") or
+                                     re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", a))]
+    if bad:
+        raise HTTPException(400, "not an email address or form URL: " + ", ".join(bad))
+
+    value = "; ".join(dict.fromkeys(picked))
+    if value:
+        rows = takedown.update_status(OUT, {u: {"manual_contacts": value} for u in urls})
+    else:
+        rows = takedown.clear_status_fields(OUT, urls, ["manual_contacts"])
+    takedown.write_status_table(OUT, rows)
+    await asyncio.to_thread(storage.push)
+    return {"ok": True, "contacts": value, "changed": len(urls)}
+
+
 @app.post("/api/config")
 async def api_config_post(request: Request):
     require_login(request)
@@ -689,9 +760,6 @@ async def api_candidates_append(request: Request):
 
 # ------------------------------------------------------------------ notices
 
-MAILTO_LIMIT = 1800
-
-
 def _parse_eml(path: Path, kind: str) -> dict:
     # policy=default gives EmailMessage (so .get_body works) and decodes the
     # quoted-printable body takedown.py's set_content() produces.
@@ -706,12 +774,10 @@ def _parse_eml(path: Path, kind: str) -> dict:
         "body": text,
         "urls": [ln.strip() for ln in text.splitlines()
                  if ln.strip().startswith("http")],
-        "too_long": len(text) > MAILTO_LIMIT,
-        "mailto": "mailto:" + quote(to) + "?subject=" + quote(subject) + "&body=" +
-                  quote(text if len(text) <= MAILTO_LIMIT else
-                        text[:MAILTO_LIMIT].rsplit("\n", 1)[0] +
-                        "\n\n[... truncated by your mail app's URL limit - use "
-                        "\"Copy full notice\" in the web app and paste it here ...]"),
+        # Address and subject only. A notice is far longer than any mail app's URL
+        # limit, so putting it here produced a draft silently cut off mid-sentence -
+        # worse than an empty one, because it still looks complete. Copy and paste.
+        "mailto": "mailto:" + quote(to) + "?subject=" + quote(subject),
     }
 
 
