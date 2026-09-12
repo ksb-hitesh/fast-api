@@ -134,6 +134,46 @@ def test_falls_back_cleanly():
     print("clean fallback OK")
 
 
+def test_ytdlp_merge():
+    """When enabled, a media URL yt-dlp returns resolves to a real hosting contact,
+    even if the page HTML itself gave nothing (gated/anti-bot player)."""
+    import origin as O
+    takedown._dns_cache.clear()
+    takedown._dns_cache["cdn-node.serverius.net"] = ("185.0.0.1", "")
+
+    async def _no_abusix(ip):
+        return []
+    orig_abusix = takedown.abusix_emails
+    orig_yt = O.ytdlp_stream_urls
+    takedown.abusix_emails = _no_abusix
+    O.ytdlp_stream_urls = lambda u: ["https://cdn-node.serverius.net/v/x.mp4"]
+
+    rdap = {"name": "SERVERIUS", "entities": [
+        {"roles": ["abuse"], "vcardArray": ["vcard", [
+            ["email", {}, "text", "abuse@serverius.net"]]]}]}
+
+    def handler(req):
+        if "rdap.org" in str(req.url):
+            return httpx.Response(200, json=rdap)
+        if req.url.params.get("type") == "PTR":
+            return httpx.Response(200, json={"Status": 0, "Answer": []})
+        return httpx.Response(200, text="<html>gated, no media here</html>")
+
+    async def go(use_ytdlp):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as c:
+            return await origin_contacts(c, "https://flash-files.com/x", use_ytdlp=use_ytdlp)
+    try:
+        _, off = _run(go(False))       # regex path alone finds nothing
+        _, on = _run(go(True))         # yt-dlp supplies the delivery host
+    finally:
+        takedown.abusix_emails = orig_abusix
+        O.ytdlp_stream_urls = orig_yt
+
+    assert off == [], off
+    assert [c.address for c in on] == ["abuse@serverius.net"], on
+    print("ytdlp merge OK")
+
+
 def test_crt_candidates():
     """Only NON-CDN cert hosts are surfaced as candidate origins."""
     takedown._dns_cache.clear()
@@ -168,5 +208,6 @@ if __name__ == "__main__":
     test_stream_urls()
     test_origin_contacts()
     test_falls_back_cleanly()
+    test_ytdlp_merge()
     test_crt_candidates()
     print("\nall checks passed")

@@ -1154,12 +1154,13 @@ async def run_evidence(args) -> int:
     return 0
 
 
-async def enrich_origins(results: list, out: Path) -> None:
+async def enrich_origins(results: list, out: Path, use_ytdlp: bool = False) -> None:
     """For CDN-masked hosts, find the real delivery host and add its abuse desk.
 
     Fetches player pages (needs the tunnel, unless --evidence cached them), reads the
     stream URL, resolves the delivery host and appends a real hosting Contact. Also
     collects crt.sh candidate origins into HOSTS.md - surfaced, never auto-mailed.
+    With use_ytdlp, yt-dlp reads gated/anti-bot players the regex path cannot.
     """
     import origin  # lazy: origin imports from takedown, so this avoids an import cycle
 
@@ -1169,7 +1170,7 @@ async def enrich_origins(results: list, out: Path) -> None:
         for url, contacts in results:
             if not any(c.kind == "hosting" and c.type == "form" for c in contacts):
                 continue  # only masked hosts pay for the extra fetch
-            diag, extra = await origin.origin_contacts(client, url, out)
+            diag, extra = await origin.origin_contacts(client, url, out, use_ytdlp)
             for h in diag["masked"]:
                 diag.setdefault("candidates", {})[h] = \
                     await origin.crt_candidates(client, origin._domain_of(h))
@@ -1244,7 +1245,7 @@ async def run(args) -> int:
 
     out = Path(args.out)
     if getattr(args, "origin", False):
-        await enrich_origins(results, out)
+        await enrich_origins(results, out, getattr(args, "use_ytdlp", False))
 
     groups = group_contacts(results)
     write_outputs(args, results, groups, ips, out)
@@ -1309,6 +1310,10 @@ def main() -> int:
                         "actually serving the video. NEEDS THE TUNNEL (it fetches pages, "
                         "unless --evidence already cached them). Also writes out/HOSTS.md "
                         "with candidate origins to confirm.")
+    p.add_argument("--use-ytdlp", action="store_true",
+                   help="with --origin, also use yt-dlp to read the stream URL out of "
+                        "gated/anti-bot players (streamtape and the like). Needs yt-dlp "
+                        "and curl_cffi installed; without them this flag is a no-op.")
     p.add_argument("--check", action="store_true",
                    help="re-fetch every URL in STATUS.csv and record whether it is "
                         "actually gone. Safe to re-run as often as you like.")

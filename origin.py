@@ -114,6 +114,46 @@ def stream_urls(text: str, page_url: str) -> list[str]:
     return out
 
 
+def ytdlp_stream_urls(page_url: str) -> list[str]:
+    """Direct media URLs via yt-dlp, with Cloudflare impersonation. [] if unavailable.
+
+    yt-dlp has maintained extractors for hundreds of file-hosts and a generic one
+    that reads gated/obfuscated players the regex path cannot, and curl_cffi lets it
+    past Cloudflare's anti-bot challenge. Optional: absent library -> []. Blocking, so
+    callers run it in a thread.
+    """
+    try:
+        from yt_dlp import YoutubeDL
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+    except ImportError:
+        return []
+    opts = {"quiet": True, "skip_download": True, "noplaylist": True,
+            "no_warnings": True, "socket_timeout": 30,
+            "impersonate": ImpersonateTarget("chrome"),
+            "extractor_args": {"generic": {"impersonate": ["chrome"]}}}
+    try:
+        with YoutubeDL(opts) as y:
+            info = y.extract_info(page_url, download=False)
+    except Exception:                       # yt-dlp raises many types; a miss is not fatal
+        return []
+    out, seen = [], set()
+
+    def walk(d):
+        if not isinstance(d, dict):
+            return
+        u = d.get("url")
+        if u and u not in seen and host_of(u):
+            seen.add(u)
+            out.append(u)
+        for f in d.get("formats") or []:
+            walk(f)
+        for e in d.get("entries") or []:
+            walk(e)
+
+    walk(info)
+    return out
+
+
 # ---------------------------------------------------------------- resolution
 
 async def ptr(client: httpx.AsyncClient, ip: str) -> str:
@@ -158,21 +198,25 @@ async def _fetch_player(client: httpx.AsyncClient, page_url: str, out) -> str:
         return ""
 
 
-async def origin_contacts(client: httpx.AsyncClient, page_url: str,
-                          out=None) -> tuple[dict, list[Contact]]:
+async def origin_contacts(client: httpx.AsyncClient, page_url: str, out=None,
+                          use_ytdlp: bool = False) -> tuple[dict, list[Contact]]:
     """(diag, hosting Contacts) for the host actually serving page_url's video.
 
     Empty contacts on any failure - a wrong host is worse than no host, so this
     never guesses. Delivery hosts that are themselves CDN-masked are recorded in
-    diag["masked"] for a crt.sh pass, not turned into a contact.
+    diag["masked"] for a crt.sh pass, not turned into a contact. With use_ytdlp,
+    also asks yt-dlp (which can read gated/anti-bot players the regex path cannot).
     """
     diag = {"page": page_url, "page_host": host_of(page_url),
             "delivery": [], "masked": []}
     text = await _fetch_player(client, page_url, out)
-    if not text:
+    media = stream_urls(text, page_url) if text else []
+    if use_ytdlp:
+        media += await asyncio.to_thread(ytdlp_stream_urls, page_url)
+    if not media:
         return diag, []
 
-    hosts = [h for h in dict.fromkeys(host_of(u) for u in stream_urls(text, page_url))
+    hosts = [h for h in dict.fromkeys(host_of(u) for u in media)
              if h and h != diag["page_host"]]
     contacts: list[Contact] = []
     for h in hosts:
@@ -255,19 +299,21 @@ def _print_candidates(host: str, cands: list[tuple[str, str, str]]) -> None:
         print(f"    {name} -> {ip}  ({prov or 'unknown network'})")
 
 
-async def _run(urls: list[str], out=None) -> int:
+async def _run(urls: list[str], out=None, use_ytdlp: bool = False) -> int:
     hosts = list(dict.fromkeys(urlsplit(u).hostname for u in urls if urlsplit(u).hostname))
     async with httpx.AsyncClient(timeout=25, follow_redirects=True,
                                  headers={"User-Agent": UA}) as client:
         pf = await preflight(client, hosts)
         print_preflight(pf)
-        if not pf["tunnel_ok"]:
+        # yt-dlp does its own (impersonated) fetching, so it can still work when our
+        # plain httpx fetch is blocked; only the regex path needs the tunnel.
+        if not pf["tunnel_ok"] and not use_ytdlp:
             print("\nCannot fetch player pages from here. Bring the tunnel up "
-                  "(README Step 0) and re-run, or run --evidence first so the pages "
-                  "are cached.")
+                  "(README Step 0) and re-run, or add --ytdlp, or run --evidence first "
+                  "so the pages are cached.")
             return 1
         for u in urls:
-            diag, _ = await origin_contacts(client, u, out)
+            diag, contacts = await origin_contacts(client, u, out, use_ytdlp)
             _print_diag(diag)
             for h in diag["masked"]:
                 _print_candidates(h, await crt_candidates(client, _domain_of(h)))
@@ -275,11 +321,13 @@ async def _run(urls: list[str], out=None) -> int:
 
 
 def main() -> int:
-    if len(sys.argv) < 2:
-        sys.exit("usage: python origin.py urls.txt [out-dir]")
-    urls = read_urls(sys.argv[1])
-    out = sys.argv[2] if len(sys.argv) > 2 else "out"
-    return asyncio.run(_run(urls, out))
+    argv = [a for a in sys.argv[1:] if a != "--ytdlp"]
+    use_ytdlp = "--ytdlp" in sys.argv
+    if not argv:
+        sys.exit("usage: python origin.py urls.txt [out-dir] [--ytdlp]")
+    urls = read_urls(argv[0])
+    out = argv[1] if len(argv) > 1 else "out"
+    return asyncio.run(_run(urls, out, use_ytdlp))
 
 
 if __name__ == "__main__":

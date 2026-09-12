@@ -7,3 +7,9 @@ python-multipart==0.0.32
 markdown-it-py==4.2.0
 itsdangerous==2.2.0
 pymongo==4.10.1
+
+# Optional: only for `--origin --use-ytdlp` (reading gated/anti-bot players).
+# yt-dlp extracts the real media URL; curl_cffi lets it pass Cloudflare's bot check.
+# Safe to omit - the --use-ytdlp flag becomes a no-op without them.
+yt-dlp==2026.8.19
+curl_cffi==0.16.3

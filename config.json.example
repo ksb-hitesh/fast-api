@@ -8,6 +8,7 @@
   "self_recorded": false,
   "archive": false,
   "origin": false,
+  "use_ytdlp": false,
   "rounds": 2,
   "portal_ack": "30412500000000",
   "sent": []
