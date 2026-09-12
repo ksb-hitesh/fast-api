@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
@@ -101,6 +101,7 @@ def build_ns(cfg: dict) -> SimpleNamespace:
         origin=bool(cfg.get("origin")),
         use_ytdlp=bool(cfg.get("use_ytdlp")),
         rounds=int(cfg.get("rounds") or 2),
+        only=None,
     )
 
 
@@ -294,6 +295,27 @@ def _url_count() -> int:
                 if ln.strip() and not ln.strip().startswith("#")])
 
 
+# A URL that was commented out to keep it out of a run, as opposed to the prose
+# comments the file also carries.
+COMMENTED_URL = re.compile(r"^#\s*(https?://\S+)$")
+
+
+def _list_urls() -> dict[str, bool]:
+    """Every URL urls.txt knows about -> True if active, False if commented out."""
+    found: dict[str, bool] = {}
+    for line in _read_urls_text().splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("#"):
+            m = COMMENTED_URL.match(s)
+            if m:
+                found.setdefault(m.group(1), False)
+        else:
+            found[s] = True
+    return found
+
+
 def _emls(folder: Path) -> list[Path]:
     return sorted(folder.glob("[0-9][0-9]-*.eml")) if folder.exists() else []
 
@@ -379,24 +401,41 @@ async def api_state(request: Request):
     require_login(request)
     rows, states = _rows_and_states()
     cfg = load_config()
-    counts: dict[str, int] = {}
-    for s in states.values():
-        counts[s] = counts.get(s, 0) + 1
     artifacts = []
     if OUT.exists():
         for f in sorted(OUT.rglob("*")):
             if f.is_file():
                 artifacts.append({"path": f.relative_to(OUT).as_posix(),
                                   "size": f.stat().st_size})
-    table = [{"url": u, "state": states[u],
-              "reported": r.get("reported_utc", ""),
-              "deadline": r.get("deadline_utc", ""),
-              "checked": r.get("last_checked_utc", ""),
-              "note": r.get("check_note", ""),
-              "evidence": bool(r.get("evidence_utc"))}
-             for u, r in sorted(rows.items(), key=lambda kv: kv[0])]
+    # Union of the two sources, so a URL added a second ago shows as NEW instead of
+    # waiting for the first step to write it a STATUS.csv row.
+    listed = _list_urls()
+    now = datetime.now(timezone.utc)
+    blank = dict.fromkeys(takedown.STATUS_FIELDS, "")
+    table = []
+    for u in sorted(set(rows) | set(listed)):
+        r = rows.get(u, blank)
+        table.append({
+            "url": u,
+            "state": states.get(u) or takedown.state_of(r, now),
+            "hostname": r.get("hostname") or (urlsplit(u).hostname or ""),
+            "reported": r.get("reported_utc", ""),
+            "deadline": r.get("deadline_utc", ""),
+            "checked": r.get("last_checked_utc", ""),
+            "http_status": r.get("http_status", ""),
+            "note": r.get("check_note", ""),
+            "contacts": r.get("contacts", ""),
+            "first_seen": r.get("first_seen_utc", ""),
+            "evidence": bool(r.get("evidence_utc")),
+            # True = in the list, False = commented out, null = tracked but the line
+            # is gone from urls.txt.
+            "in_list": listed.get(u),
+        })
+    counts: dict[str, int] = {}
+    for t in table:
+        counts[t["state"]] = counts.get(t["state"], 0) + 1
     return {
-        "counts": counts, "total": len(rows), "urls": _url_count(),
+        "counts": counts, "total": len(table), "urls": _url_count(),
         "table": table, "todo": _todo(rows, states, cfg),
         "artifacts": artifacts, "config": cfg,
         "job": _job.as_dict() if _job else None,
@@ -445,6 +484,8 @@ async def api_run(request: Request, step: str):
         raise HTTPException(409, "a step is already running")
 
     ns = build_ns(cfg)
+    if step in {"report", "check"}:
+        ns.only = [u for u in (body.get("urls") or []) if u.startswith("http")] or None
     _job = Job(step=step)
     _publish({"type": "start", "job": _job.as_dict()})
 
@@ -511,6 +552,86 @@ async def api_urls_post(request: Request):
     URLS.write_text(text)
     await asyncio.to_thread(storage.push)
     return {"ok": True, "count": _url_count()}
+
+
+def _write_urls(lines: list[str]) -> None:
+    URLS.write_text("\n".join(lines) + "\n")
+
+
+def _url_lines() -> list[str]:
+    return _read_urls_text().splitlines()
+
+
+def _line_url(line: str) -> str | None:
+    """The URL a urls.txt line carries, commented out or not. None for prose."""
+    s = line.strip()
+    if not s:
+        return None
+    m = COMMENTED_URL.match(s)
+    if m:
+        return m.group(1)
+    return None if s.startswith("#") else s
+
+
+@app.post("/api/urls/edit")
+async def api_urls_edit(request: Request):
+    """Row-level edits to urls.txt: add, include/exclude, remove.
+
+    Exclusion is the `#` prefix the file format already has, so an excluded URL drops
+    out of every step without a second place to store the fact.
+    """
+    require_login(request)
+    body = await request.json()
+    op = body.get("op")
+    lines = _url_lines()
+    result: dict = {}
+
+    if op == "add":
+        known = set(_list_urls())
+        fresh = list(dict.fromkeys(
+            u for u in (body.get("text") or "").split()
+            if u.startswith("http") and u not in known))
+        if not fresh:
+            raise HTTPException(400, "nothing new to add - "
+                                     "these URLs are already in the list")
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        _write_urls(lines + [f"# added {stamp}"] + fresh)
+        result = {"added": len(fresh)}
+
+    elif op == "include":
+        on = bool(body.get("on", True))
+        picked = set(body.get("urls") or [])
+        if not picked:
+            raise HTTPException(400, "nothing selected")
+        out, n = [], 0
+        for line in lines:
+            u = _line_url(line)
+            if u in picked:
+                new = u if on else f"# {u}"
+                if new != line.strip():
+                    n += 1
+                out.append(new)
+            else:
+                out.append(line)
+        _write_urls(out)
+        result = {"changed": n}
+
+    elif op == "remove":
+        picked = set(body.get("urls") or [])
+        if not picked:
+            raise HTTPException(400, "nothing selected")
+        _write_urls([ln for ln in lines if _line_url(ln) not in picked])
+        # The status row goes too, or /api/state keeps showing a ghost row for a URL
+        # that is no longer in the list. Saved evidence stays: it is the proof the
+        # page existed, and losing it to a stray click is not recoverable.
+        takedown.drop_status_rows(OUT, picked)
+        result = {"removed": len(picked)}
+
+    else:
+        raise HTTPException(400, "op must be add, include or remove")
+
+    await asyncio.to_thread(storage.push)
+    return {"ok": True, "count": _url_count(), **result}
 
 
 @app.post("/api/config")
@@ -632,6 +753,61 @@ async def api_notices_sent(request: Request):
     save_config(cfg)
     await asyncio.to_thread(storage.push)
     return {"ok": True}
+
+
+UNREPORT = ["reported_utc", "deadline_utc", "followup_utc", "contacts"]
+
+
+@app.post("/api/notices/delete")
+async def api_notices_delete(request: Request):
+    """Drop a notice and put the URLs it covered back to un-reported.
+
+    Deleting only the file would leave reported_utc set, so those URLs would look
+    reported with nothing to show for it and the next report pass would skip them.
+    """
+    require_login(request)
+    body = await request.json()
+    key = body.get("file") or body.get("form_url") or ""
+    if not key:
+        raise HTTPException(400, "file or form_url is required")
+
+    urls: list[str] = []
+    if body.get("file"):
+        p = _resolve(key)
+        if p.suffix.lower() != ".eml":
+            raise HTTPException(400, "only notice drafts can be deleted here")
+        urls = _parse_eml(p, "notice")["urls"]
+        p.unlink()
+        storage.forget(f"out/{key}")
+    else:
+        # A web-form desk has no file of its own - it is one section of FORMS.md,
+        # so deleting it means cutting that section out.
+        fm = OUT / "FORMS.md"
+        if not fm.exists():
+            raise HTTPException(404, "no such form")
+        text = fm.read_text()
+        m = next((m for m in FORM_RE.finditer(text) if m.group("url") == key), None)
+        if m is None:
+            raise HTTPException(404, "no such form")
+        urls = [ln.strip() for ln in m.group("body").splitlines()
+                if ln.strip().startswith("http")]
+        rest = text[:m.start()] + text[m.end():]
+        if FORM_RE.search(rest):
+            fm.write_text(rest)
+        else:
+            fm.unlink()
+            storage.forget("out/FORMS.md")
+
+    takedown.clear_status_fields(OUT, urls, UNREPORT)
+    rows = takedown.load_status(OUT)
+    takedown.write_status_table(OUT, rows)
+
+    cfg = load_config()
+    # /api/notices/sent keys a follow-up on its bare filename, not its out/ path.
+    cfg["sent"] = sorted(set(cfg.get("sent", [])) - {key, key.rsplit("/", 1)[-1]})
+    save_config(cfg)
+    await asyncio.to_thread(storage.push)
+    return {"ok": True, "unreported": len(urls)}
 
 
 # ------------------------------------------------------------------ artifacts

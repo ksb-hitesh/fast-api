@@ -10,9 +10,10 @@ import hashlib
 
 import httpx
 
-from takedown import (STATUS_FIELDS, Contact, check_one, doh_resolve, group_contacts,
-                      jinja_env, load_status, overdue_rows, poisoned_hosts, render,
-                      slug, state_of, update_status, write_discovery)
+from takedown import (STATUS_FIELDS, Contact, check_one, clear_status_fields,
+                      doh_resolve, drop_status_rows, group_contacts, jinja_env,
+                      load_status, overdue_rows, poisoned_hosts, read_urls, render,
+                      slug, state_of, subset, update_status, write_discovery)
 
 
 def test_grouping():
@@ -169,6 +170,62 @@ def test_discovery():
     assert "%22a+b%22" in md, "title must be quoted and url-encoded"
     assert "search manually" in md, "a page with no leads must say so, not vanish"
     print("discovery OK")
+
+
+def test_read_urls_collapses_duplicates():
+    """A URL pasted twice must not produce two rows, two log lines and two notices."""
+    with tempfile.TemporaryDirectory() as d:
+        f = Path(d) / "urls.txt"
+        f.write_text("# a comment\nhttps://s.com/a\nhttps://s.com/b\nhttps://s.com/a\n")
+        assert read_urls(str(f)) == ["https://s.com/a", "https://s.com/b"]
+
+
+def test_subset_narrows_a_run_and_refuses_a_miss():
+    urls = ["https://s.com/a", "https://s.com/b"]
+    assert subset(urls, Namespace(only=None)) == urls
+    assert subset(urls, Namespace()) == urls
+    assert subset(urls, Namespace(only=["https://s.com/b"])) == ["https://s.com/b"]
+    try:
+        subset(urls, Namespace(only=["https://elsewhere.io/x"]))
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("a selection matching nothing must not run over everything")
+
+
+def test_clearing_undoes_what_update_status_cannot():
+    """update_status() skips empty values on purpose, so un-reporting needs its own
+    path - otherwise a deleted notice leaves the URL looking reported forever."""
+    with tempfile.TemporaryDirectory() as d:
+        out, u, v = Path(d), "https://s.com/a", "https://s.com/b"
+        update_status(out, {u: {"evidence_utc": "e", "reported_utc": "r",
+                                "deadline_utc": "dl", "contacts": "abuse@h.com"},
+                            v: {"reported_utc": "r"}})
+        assert update_status(out, {u: {"reported_utc": ""}})[u]["reported_utc"] == "r"
+
+        rows = clear_status_fields(out, [u], ["reported_utc", "deadline_utc", "contacts"])
+        assert rows[u]["reported_utc"] == "" and rows[u]["contacts"] == ""
+        assert rows[u]["evidence_utc"] == "e", "clearing must not touch the evidence"
+        assert rows[v]["reported_utc"] == "r", "only the named rows change"
+        assert state_of(rows[u], datetime.now(timezone.utc)) == "EVIDENCE"
+        assert load_status(out)[u]["reported_utc"] == "", "must survive the round trip"
+
+        assert set(drop_status_rows(out, [v])) == {u}
+        assert set(load_status(out)) == {u}
+
+
+def test_followup_skips_urls_whose_notice_was_deleted():
+    """LOG.csv is append-only, so nothing else stops a deleted notice being chased."""
+    with tempfile.TemporaryDirectory() as d:
+        out, u = Path(d), "https://s.com/a"
+        old = (datetime.now(timezone.utc) - timedelta(hours=10)).isoformat(timespec="seconds")
+        (out / "LOG.csv").write_text(
+            "logged_at_utc,url,hostname,ip,kind,provider,contact,contact_type\n"
+            f"{old},{u},s.com,1.2.3.4,hosting,H,abuse@h.com,email\n")
+        update_status(out, {u: {"reported_utc": old}})
+        assert overdue_rows(out, 2.0), "a genuinely overdue URL must be chased"
+        clear_status_fields(out, [u], ["reported_utc"])
+        assert not overdue_rows(out, 2.0)
 
 
 def test_status_accumulates():

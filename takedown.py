@@ -567,10 +567,38 @@ def update_status(out: Path, updates: dict[str, dict]) -> dict[str, dict]:
             row.update(url=url, hostname=urlsplit(url).hostname or "",
                        first_seen_utc=now_utc())
         row.update({k: v for k, v in fields.items() if v != ""})
+    _write_status_csv(out, rows)
+    return rows
+
+
+def _write_status_csv(out: Path, rows: dict[str, dict]) -> None:
+    out.mkdir(parents=True, exist_ok=True)
     with (out / "STATUS.csv").open("w", newline="") as fh:
         w = csv.DictWriter(fh, STATUS_FIELDS)
         w.writeheader()
         w.writerows(rows[u] for u in sorted(rows))
+
+
+def clear_status_fields(out: Path, urls, fields) -> dict[str, dict]:
+    """Blank named columns on named rows.
+
+    update_status() skips empty values on purpose, so it can only ever add facts.
+    Undoing one - deleting a notice puts its URLs back to un-reported - needs this.
+    """
+    rows = load_status(out)
+    for url in urls:
+        if url in rows:
+            rows[url].update(dict.fromkeys(fields, ""))
+    _write_status_csv(out, rows)
+    return rows
+
+
+def drop_status_rows(out: Path, urls) -> dict[str, dict]:
+    """Forget these URLs entirely - used when they leave the URL list."""
+    rows = load_status(out)
+    for url in urls:
+        rows.pop(url, None)
+    _write_status_csv(out, rows)
     return rows
 
 
@@ -681,6 +709,7 @@ async def run_check(args) -> int:
     rows = load_status(out)
     if not rows:
         sys.exit(f"no {out}/STATUS.csv yet - run --evidence or a reporting pass first")
+    rows = {u: rows[u] for u in subset(rows, args)}
 
     sem = asyncio.Semaphore(4)
     async with httpx.AsyncClient(timeout=20, follow_redirects=True,
@@ -934,7 +963,10 @@ def overdue_rows(out: Path, hours: float) -> dict[str, dict]:
     # Anything a check already confirmed gone must not be chased again - sending a
     # second notice about content that is already down destroys your credibility
     # with the one desk that actually acted.
-    done = {u for u, r in load_status(out).items() if r.get("removed_utc")}
+    # A URL whose notice was deleted has had reported_utc cleared: it is no longer
+    # reported, so there is nothing to follow up on either.
+    done = {u for u, r in load_status(out).items()
+            if r.get("removed_utc") or not r.get("reported_utc")}
     groups: dict[str, dict] = {}
     with log.open(newline="") as fh:
         for row in csv.DictReader(fh):
@@ -1085,9 +1117,20 @@ def write_outputs(args, results, groups, ips: dict, out: Path) -> None:
 
 # ---------------------------------------------------------------- main
 
+def subset(urls, args) -> list:
+    """Narrow a run to --only, when given. Anything not on the list is untouched."""
+    only = getattr(args, "only", None)
+    if not only:
+        return list(urls)
+    picked = [u for u in urls if u in set(only)]
+    if not picked:
+        sys.exit("none of the selected URLs are in the list")
+    return picked
+
+
 def read_urls(path: str) -> list[str]:
     lines = [ln.strip() for ln in Path(path).read_text().splitlines()]
-    urls = [u for u in lines if u and not u.startswith("#")]
+    urls = list(dict.fromkeys(u for u in lines if u and not u.startswith("#")))
     if not urls:
         sys.exit(f"no URLs in {path} - add the page URLs, one per line")
     return urls
@@ -1221,7 +1264,7 @@ def write_hosts(diags: list, out: Path) -> None:
 
 
 async def run(args) -> int:
-    urls = read_urls(args.urls)
+    urls = subset(read_urls(args.urls), args)
 
     bad = [u for u in urls if not urlsplit(u).hostname]
     if bad:
@@ -1321,6 +1364,9 @@ def main() -> int:
                    help="read out/LOG.csv, find who blew the deadline, draft second "
                         "notices and an escalation checklist")
     p.add_argument("--out", default="out", help="output directory (default: out)")
+    p.add_argument("--only", nargs="*", metavar="URL",
+                   help="restrict this run to these URLs (reporting and --check). "
+                        "Anything not listed keeps whatever status it already had.")
     args = p.parse_args()
 
     if args.evidence:

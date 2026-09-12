@@ -47,13 +47,31 @@
 <!-- ───────────────────────────────── urls ───────────────────────────────── -->
 <section id="p-urls" class="panel" hidden>
   <div class="card">
-    <h2>URL list</h2>
-    <p class="muted sm">One page URL per line. Lines starting with <code>#</code> are
-      ignored. This never leaves your instance or gets committed.</p>
-    <textarea id="urls-text" rows="14" spellcheck="false"
-              placeholder="https://example-site.com/video/12345"></textarea>
-    <button onclick="saveUrls()">Save</button>
-    <span id="urls-msg" class="muted sm"></span>
+    <div class="row"><h2>URL list</h2><span id="urls-count" class="muted sm"></span></div>
+    <p class="muted sm">Everything the tool works on. Untick <b>In report</b> to hold a
+      URL back from the next run without losing it. This never leaves your instance or
+      gets committed.</p>
+    <div class="row">
+      <button onclick="addurls.showModal()">+ Add URLs</button>
+      <button class="ghost sm sel" onclick="recheckSel()" disabled>↻ Recheck</button>
+      <button class="ghost sm sel" onclick="reportSel()" disabled>📤 Generate notices</button>
+      <button class="ghost sm sel" onclick="includeSel(true)" disabled>✓ In report</button>
+      <button class="ghost sm sel" onclick="includeSel(false)" disabled>✗ Out</button>
+      <button class="ghost sm sel danger" onclick="removeSel()" disabled>🗑 Remove</button>
+    </div>
+    <div id="urls-table"></div>
+  </div>
+
+  <div class="card">
+    <details>
+      <summary class="sm">Edit as text</summary>
+      <p class="muted sm">One URL per line. Lines starting with <code>#</code> are
+        ignored — that is what <b>Out</b> above does.</p>
+      <textarea id="urls-text" rows="14" spellcheck="false"
+                placeholder="https://example-site.com/video/12345"></textarea>
+      <button onclick="saveUrls()">Save</button>
+      <span id="urls-msg" class="muted sm"></span>
+    </details>
   </div>
 </section>
 
@@ -151,6 +169,20 @@
     <div class="row">
       <button onclick="saveIdentity()">Save</button>
       <button class="ghost" onclick="identity.close()">Cancel</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="addurls">
+  <form method="dialog" onsubmit="return false">
+    <h2>Add URLs</h2>
+    <p class="muted sm">One full URL per line. Anything already in the list is skipped.</p>
+    <textarea id="add-text" rows="8" spellcheck="false"
+              placeholder="https://example-site.com/video/12345"></textarea>
+    <p id="add-err" class="err sm" hidden></p>
+    <div class="row">
+      <button onclick="addUrls()">Add</button>
+      <button class="ghost" onclick="addurls.close()">Cancel</button>
     </div>
   </form>
 </dialog>

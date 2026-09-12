@@ -3,9 +3,13 @@
     python test_app.py
 """
 import asyncio
+import contextlib
+import email.message
 import os
 import sys
 import tempfile
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -161,6 +165,124 @@ def test_todo_says_what_is_manual():
             assert "portal" not in [x["k"] for x in app._todo(rows, {}, cfg)]
         finally:
             app.OUT, app.URLS = out, urls
+
+
+@contextlib.contextmanager
+def sandbox(urls_text=""):
+    """Point app.OUT/URLS/CONFIG at a throwaway tree, and log a client in."""
+    from fastapi.testclient import TestClient
+    with tempfile.TemporaryDirectory() as d:
+        saved = app.OUT, app.URLS, app.CONFIG
+        app.OUT = Path(d) / "out"
+        app.URLS = Path(d) / "urls.txt"
+        app.CONFIG = Path(d) / "config.json"
+        app.OUT.mkdir()
+        app.URLS.write_text(urls_text)
+        try:
+            with TestClient(app.app) as c:
+                c.post("/login", data={"password": "test-password"})
+                yield c
+        finally:
+            app.OUT, app.URLS, app.CONFIG = saved
+
+
+A, B = "https://site.com/a", "https://site.com/b"
+
+
+def test_urls_edit_add_dedupes_against_active_and_excluded():
+    with sandbox(f"{A}\n# {B}\n") as c:
+        r = c.post("/api/urls/edit", json={"op": "add", "text": f"{A}\n{B}\nhttps://c.io/x"})
+        assert r.status_code == 200 and r.json()["added"] == 1, r.json()
+        assert app._read_urls_text().count(A) == 1
+        # already-known-only input is refused rather than silently doing nothing
+        assert c.post("/api/urls/edit", json={"op": "add", "text": A}).status_code == 400
+
+
+def test_urls_edit_include_toggles_the_comment_prefix():
+    with sandbox(f"{A}\n{B}\n") as c:
+        assert app._url_count() == 2
+        c.post("/api/urls/edit", json={"op": "include", "urls": [B], "on": False})
+        assert app._list_urls() == {A: True, B: False}
+        assert app._url_count() == 1                       # B drops out of every step
+        assert takedown.read_urls(str(app.URLS)) == [A]
+        c.post("/api/urls/edit", json={"op": "include", "urls": [B], "on": True})
+        assert app._list_urls() == {A: True, B: True}
+
+
+def test_urls_edit_remove_drops_the_line_and_the_status_row():
+    with sandbox(f"{A}\n{B}\n") as c:
+        takedown.update_status(app.OUT, {A: {"evidence_utc": "x"}, B: {"evidence_utc": "y"}})
+        c.post("/api/urls/edit", json={"op": "remove", "urls": [B]})
+        assert app._list_urls() == {A: True}
+        assert set(takedown.load_status(app.OUT)) == {A}
+
+
+def test_state_table_unions_the_list_with_the_tracker():
+    with sandbox(f"{A}\n# {B}\n") as c:
+        takedown.update_status(app.OUT, {"https://gone.io/x": {"evidence_utc": "z"}})
+        t = {r["url"]: r for r in c.get("/api/state").json()["table"]}
+        assert t[A]["state"] == "NEW" and t[A]["in_list"] is True   # no row yet
+        assert t[B]["in_list"] is False                             # held back
+        assert t["https://gone.io/x"]["in_list"] is None            # orphaned row
+
+
+def test_run_passes_the_selection_through_as_only():
+    seen = {}
+
+    async def spy(step, ns, offline):
+        seen["only"] = ns.only
+
+    with sandbox(f"{A}\n{B}\n") as c:
+        (app.OUT / "STATUS.csv").write_text("url\n")
+        real, app._dispatch = app._dispatch, spy
+        try:
+            r = c.post("/api/run/check", json={"urls": [B, "not-a-url"]})
+            assert r.status_code == 200, r.json()
+            for _ in range(200):
+                if "only" in seen:
+                    break
+                time.sleep(0.01)
+        finally:
+            app._dispatch = real
+    assert seen["only"] == [B], seen
+
+
+def test_deleting_a_notice_puts_its_urls_back_to_unreported():
+    with sandbox(f"{A}\n") as c:
+        takedown.update_status(app.OUT, {A: {"reported_utc": "2026-01-01T00:00:00+00:00",
+                                             "deadline_utc": "2026-01-01T02:00:00+00:00",
+                                             "evidence_utc": "2026-01-01T00:00:00+00:00",
+                                             "contacts": "abuse@h.com"}})
+        msg = email.message.EmailMessage()
+        msg["Subject"], msg["To"], msg["From"] = "s", "abuse@h.com", "me@x.com"
+        msg.set_content(f"URLS\n\n{A}\n")
+        (app.OUT / "01-abuse-h.com.eml").write_bytes(msg.as_bytes())
+        app.save_config(dict(app.DEFAULT_CONFIG, sent=["01-abuse-h.com.eml"]))
+
+        r = c.post("/api/notices/delete", json={"file": "01-abuse-h.com.eml"})
+        assert r.status_code == 200 and r.json()["unreported"] == 1, r.json()
+        assert not (app.OUT / "01-abuse-h.com.eml").exists()
+        assert app.load_config()["sent"] == []
+        row = takedown.load_status(app.OUT)[A]
+        assert row["reported_utc"] == "" and row["contacts"] == ""
+        # back to EVIDENCE, so the next reporting pass picks it up again
+        assert takedown.state_of(row, datetime.now(timezone.utc)) == "EVIDENCE"
+
+
+def test_deleting_a_form_notice_cuts_it_out_of_forms_md():
+    with sandbox(f"{A}\n") as c:
+        takedown.update_status(app.OUT, {A: {"reported_utc": "2026-01-01T00:00:00+00:00"}})
+        (app.OUT / "FORMS.md").write_text(
+            "# Abuse desks that only take a web form\n\n"
+            f"## Cloudflare\n\nForm: https://abuse.cloudflare.com/\n\nCovers 1 URL(s).\n"
+            f"\nSubject:\n\n    subj\n\nBody:\n\n```\nURLS\n{A}\n```\n")
+        r = c.post("/api/notices/delete",
+                   json={"form_url": "https://abuse.cloudflare.com/"})
+        assert r.status_code == 200 and r.json()["unreported"] == 1, r.json()
+        assert not (app.OUT / "FORMS.md").exists()      # it was the only section
+        assert takedown.load_status(app.OUT)[A]["reported_utc"] == ""
+        assert c.post("/api/notices/delete",
+                      json={"form_url": "https://abuse.cloudflare.com/"}).status_code == 404
 
 
 def test_mongo_roundtrip_preserves_evidence_bytes():

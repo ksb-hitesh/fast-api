@@ -62,7 +62,7 @@ async function refresh() {
   $('#storage').textContent = S.storage === 'mongodb' ? 'saved to mongodb' : 'ephemeral';
   $('#storage').style.color = S.storage === 'mongodb' ? '' : 'var(--warn)';
   $('#urlcount').textContent = `${S.urls} URL${S.urls === 1 ? '' : 's'} in the list`;
-  drawCounts(); drawTodo(); drawMini(); drawSteps(); drawFiles();
+  drawCounts(); drawTodo(); drawMini(); drawSteps(); drawFiles(); drawUrls();
   $('#nav-cand').hidden = !S.candidates;
   $('#nav-not').hidden = !S.notices;
   if (S.job) showJob(S.job);
@@ -119,7 +119,7 @@ function drawMini() {
     '<th>Last check</th></tr></thead><tbody>' +
     S.table.map(r => `<tr><td class="brk">${esc(r.url)}</td>` +
       `<td><i class="dotc s-${esc(r.state)}"></i> ${esc(r.state)}</td>` +
-      `<td>${esc((r.checked || '').slice(0, 16).replace('T', ' ') || '—')}` +
+      `<td>${short(r.checked)}` +
       (r.note ? `<br><span class="muted sm">${esc(r.note)}</span>` : '') +
       '</td></tr>').join('') + '</tbody></table></div>';
 }
@@ -184,6 +184,10 @@ function disabledReason(id) {
 async function runStep(s) {
   if ((s.id === 'report' || s.id === 'followup') && S.needs_identity)
     return openIdentity();
+  // Step 3 from here means "everything currently in the list", but it still goes
+  // through the same gate the URLs tab uses, so nothing is re-reported by surprise.
+  if (s.id === 'report')
+    return reportRun(S.table.filter(r => r.in_list).map(r => r.url));
 
   const body = {};
   if (s.id === 'discover') {
@@ -253,6 +257,119 @@ function connect() {
 }
 
 /* ─────────────────────────── urls ─────────────────────────── */
+const urlBoxes = () => [...document.querySelectorAll('#urls-table input[value]')];
+const picked = () => urlBoxes().filter(b => b.checked).map(b => b.value);
+const short = t => t ? esc(t.slice(0, 16).replace('T', ' ')) : '—';
+
+function syncUrlBtns() {
+  const n = picked().length;
+  document.querySelectorAll('#p-urls .sel').forEach(b => b.disabled = !n);
+}
+
+function drawUrls() {
+  const t = $('#urls-table'), rows = S.table;
+  const held = rows.filter(r => r.in_list === false).length;
+  $('#urls-count').textContent = rows.length
+    ? `${S.urls} in the next run${held ? ` · ${held} held back` : ''}` : '';
+  if (!rows.length) {
+    t.innerHTML = '<p class="muted sm">Nothing here yet. <b>+ Add URLs</b> to start.</p>';
+    return syncUrlBtns();
+  }
+  t.innerHTML = '<div class="scroll"><table><thead><tr><th><input type="checkbox" '
+    + 'id="url-all" aria-label="Select all"></th><th>URL</th><th>Status</th>'
+    + '<th>Reported</th><th>Last check</th><th>In report</th></tr></thead><tbody>'
+    + rows.map(r => {
+      // null means STATUS.csv still tracks it but the line is gone from urls.txt.
+      const orphan = r.in_list === null || r.in_list === undefined;
+      const out = r.in_list === false;
+      return `<tr${out || orphan ? ' style="opacity:.55"' : ''}>`
+        + `<td><input type="checkbox" value="${esc(r.url)}"></td>`
+        + `<td class="brk">${esc(r.url)}`
+        + (orphan ? '<br><span class="muted sm">tracked, no longer in the list</span>' : '')
+        + `</td><td><i class="dotc s-${esc(r.state)}"></i> ${esc(r.state)}`
+        + (r.note ? `<br><span class="muted sm">${esc(r.note)}`
+            + (r.http_status ? ` · ${esc(r.http_status)}` : '') + '</span>' : '')
+        + `</td><td>${short(r.reported)}`
+        + (r.deadline ? `<br><span class="muted sm">due ${short(r.deadline)}</span>` : '')
+        + `</td><td>${short(r.checked)}</td>`
+        + `<td>${orphan ? '—' : out ? '✗' : '✓'}</td></tr>`;
+    }).join('') + '</tbody></table></div>';
+  $('#url-all').onchange = e => {
+    urlBoxes().forEach(b => b.checked = e.target.checked);
+    syncUrlBtns();
+  };
+  urlBoxes().forEach(b => b.onchange = syncUrlBtns);
+  syncUrlBtns();
+}
+
+async function urlEdit(payload, msg) {
+  const r = await fetch('/api/urls/edit', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) return toast(j.detail || 'failed');
+  toast(msg(j));
+  refresh();
+}
+
+async function addUrls() {
+  const r = await fetch('/api/urls/edit', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ op: 'add', text: $('#add-text').value }),
+  });
+  const j = await r.json().catch(() => ({}));
+  $('#add-err').textContent = j.detail || '';
+  $('#add-err').hidden = r.ok;
+  if (!r.ok) return;
+  $('#add-text').value = '';
+  addurls.close();
+  toast(`Added ${j.added}. Capture evidence for them next.`);
+  refresh();
+}
+
+const includeSel = on => urlEdit({ op: 'include', urls: picked(), on },
+  j => on ? `${j.changed} back in the next run.` : `${j.changed} held back.`);
+
+async function removeSel() {
+  const urls = picked();
+  if (!await ask(`Remove ${urls.length} URL(s)?`,
+    '<p>They leave the list and their tracked status is deleted.</p>' +
+    '<p class="muted sm">Saved evidence stays — that is the proof the page existed. ' +
+    'To stop working on a URL without deleting anything, use <b>Out</b> instead.</p>'))
+    return;
+  urlEdit({ op: 'remove', urls }, j => `Removed ${j.removed}.`);
+}
+
+const stepBy = id => STEPS.find(s => s.id === id);
+const recheckSel = () => start(stepBy('check'), { urls: picked() });
+const reportSel = () => reportRun(picked());
+
+/* Nothing is silently re-reported. A URL that already went out is listed and left
+   unticked: re-reporting restarts its deadline, which is rarely what you want —
+   chasing a desk that ignored you is what "Follow up" is for. */
+async function reportRun(urls) {
+  if (S.needs_identity) return openIdentity();
+  const by = Object.fromEntries(S.table.map(r => [r.url, r]));
+  const again = urls.filter(u => by[u] && by[u].reported);
+  let extra = [];
+  if (again.length) {
+    const ok = await ask(`${again.length} already reported`,
+      '<p class="muted sm">These went out once already. Leave them unticked unless you '
+      + 'mean to start a fresh deadline — to chase a desk that ignored you, run '
+      + '<b>5 · Follow up</b> instead.</p>'
+      + again.map(u => '<label class="check"><input type="checkbox" '
+          + `value="${esc(u)}"><span><span class="brk">${esc(u)}</span><br>`
+          + `<span class="muted sm">reported ${short(by[u].reported)}</span>`
+          + '</span></label>').join(''));
+    if (!ok) return;
+    extra = [...document.querySelectorAll('#c-body input:checked')].map(b => b.value);
+  }
+  const final = [...new Set([...urls.filter(u => !(by[u] && by[u].reported)), ...extra])];
+  if (!final.length) return toast('Nothing to report — those are all reported already.');
+  start(stepBy('report'), { urls: final });
+}
+
 async function loadUrls() {
   $('#urls-text').value = await (await fetch('/api/urls')).text();
 }
@@ -347,6 +464,9 @@ function noticeCard(i) {
   row.append(dl);
   row.append(mk(i.sent ? '↩ Not sent' : '✓ Mark sent',
     () => markSent(i.file, !i.sent), 'ghost sm'));
+  row.append(mk('🗑 Delete', () => delNotice(
+    { file: (i.kind === 'notice' ? '' : 'followup/') + i.file },
+    i.to, i.urls.length), 'ghost sm danger'));
   card.append(row);
   return card;
 }
@@ -369,8 +489,28 @@ function formCard(f) {
   row.append(mk('📋 Copy subject', () => copy(f.subject), 'ghost sm'));
   row.append(mk(f.sent ? '↩ Not done' : '✓ Mark done',
     () => markSent(f.url, !f.sent), 'ghost sm'));
+  row.append(mk('🗑 Delete', () => delNotice({ form_url: f.url }, f.provider, f.count),
+    'ghost sm danger'));
   card.append(row);
   return card;
+}
+
+/* Deleting the draft alone would leave its URLs stamped reported_utc with nothing
+   to show for it, and the next reporting pass would treat them as done. */
+async function delNotice(payload, who, n) {
+  if (!await ask(`Delete the notice to ${who}?`,
+    `<p>The draft goes, and its ${n} URL(s) go back to <b>un-reported</b> so the next ` +
+    'reporting pass picks them up again.</p>' +
+    '<p class="muted sm">If you already sent it, deleting the draft does not unsend ' +
+    'it — the contact stays in LOG.csv.</p>')) return;
+  const r = await fetch('/api/notices/delete', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) return toast(j.detail || 'failed');
+  toast(`Deleted — ${j.unreported} URL(s) back to un-reported.`);
+  loadNotices(); refresh();
 }
 
 async function markSent(file, sent) {
