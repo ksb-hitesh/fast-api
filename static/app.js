@@ -350,14 +350,22 @@ const reportSel = () => reportRun(picked());
    chasing a desk that ignored you is what "Follow up" is for. */
 async function reportRun(urls) {
   if (S.needs_identity) return openIdentity();
+  if (!urls.length) return toast('Nothing selected.');
   const by = Object.fromEntries(S.table.map(r => [r.url, r]));
+  const fresh = urls.filter(u => !(by[u] && by[u].reported));
   const again = urls.filter(u => by[u] && by[u].reported);
   let extra = [];
   if (again.length) {
     const ok = await ask(`${again.length} already reported`,
-      '<p class="muted sm">These went out once already. Leave them unticked unless you '
-      + 'mean to start a fresh deadline — to chase a desk that ignored you, run '
-      + '<b>5 · Follow up</b> instead.</p>'
+      (fresh.length
+        ? `<p><b>${fresh.length} new URL(s)</b> will be reported. The rest went out `
+          + 'already — tick any you want to send again.</p>'
+        : '<p><b>Every URL you picked has already been reported.</b> Tick the ones to '
+          + 'send again, or cancel — nothing happens otherwise.</p>')
+      + '<p class="muted sm">Re-reporting restarts the deadline. To chase a desk that '
+      + 'ignored you, run <b>5 · Follow up</b> instead.</p>'
+      + '<div class="row"><button class="ghost sm" onclick="tickAll(this)">Tick all'
+      + '</button></div>'
       + again.map(u => '<label class="check"><input type="checkbox" '
           + `value="${esc(u)}"><span><span class="brk">${esc(u)}</span><br>`
           + `<span class="muted sm">reported ${short(by[u].reported)}</span>`
@@ -365,9 +373,17 @@ async function reportRun(urls) {
     if (!ok) return;
     extra = [...document.querySelectorAll('#c-body input:checked')].map(b => b.value);
   }
-  const final = [...new Set([...urls.filter(u => !(by[u] && by[u].reported)), ...extra])];
-  if (!final.length) return toast('Nothing to report — those are all reported already.');
+  const final = [...new Set([...fresh, ...extra])];
+  if (!final.length)
+    return toast('Nothing reported — none were ticked to send again.');
   start(stepBy('report'), { urls: final });
+}
+
+function tickAll(btn) {
+  const boxes = [...document.querySelectorAll('#c-body input[type=checkbox]')];
+  const all = boxes.every(b => b.checked);
+  boxes.forEach(b => b.checked = !all);
+  btn.textContent = all ? 'Tick all' : 'Untick all';
 }
 
 async function loadUrls() {
@@ -628,10 +644,12 @@ async function saveCfg(patch) {
 function ask(title, html) {
   $('#c-title').textContent = title;
   $('#c-body').innerHTML = html;
-  confirm.showModal();
+  confirmdlg.showModal();
   return new Promise(res => {
-    $('#c-ok').onclick = () => { confirm.close(); res(true); };
-    confirm.onclose = () => res(false);
+    // Drop the cancel handler first: close() fires `close` on its own, and which of
+    // the two resolves first must not decide the answer.
+    $('#c-ok').onclick = () => { confirmdlg.onclose = null; confirmdlg.close(); res(true); };
+    confirmdlg.onclose = () => res(false);
   });
 }
 

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import email.message
 import os
+import re
 import sys
 import tempfile
 import time
@@ -345,6 +346,27 @@ def test_sample_files_match_the_code():
     # every env var the code actually reads must be documented
     for key in ("APP_PASSWORD", "SESSION_SECRET", "MONGODB_URI", "MONGODB_DB"):
         assert key in env
+
+
+def test_dialog_ids_do_not_shadow_window_builtins():
+    """app.js opens dialogs through the id-global (`identity.showModal()`).
+
+    That only reaches the element when window has no property of that name - and a
+    Window built-in wins. `<dialog id="confirm">` resolved to window.confirm, so
+    ask() threw a TypeError and every button behind it silently did nothing.
+    """
+    html = Path("templates/app.html").read_text()
+    js = Path("static/app.js").read_text()
+    builtins = {"confirm", "alert", "prompt", "print", "close", "open", "focus",
+                "blur", "status", "name", "length", "top", "self", "parent",
+                "history", "location", "navigator", "screen", "find", "stop"}
+    ids = re.findall(r'<dialog id="([^"]+)"', html)
+    assert ids, "no dialogs found - did the template move?"
+    for i in ids:
+        assert i not in builtins, (
+            f'<dialog id="{i}"> is shadowed by window.{i}; rename it')
+        # and it must actually be driven that way somewhere, or this check is moot
+        assert f"{i}.showModal()" in js or f"{i}.close()" in js or f"{i}.close()" in html
 
 
 def test_secrets_stay_out_of_the_image():
